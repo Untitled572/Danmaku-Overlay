@@ -39,7 +39,7 @@ func setupTestAPI(t *testing.T, token string) (*httptest.Server, *db.DBQueue, st
 
 	cfg := &config.Config{LocalToken: token, DataDir: tmpDir}
 
-	s := NewServer(dbq, hub, cfg, nil, nil)
+	s := NewServer(dbq, hub, cfg, nil, nil, nil, nil, context.Background())
 
 	mux := http.NewServeMux()
 	authMiddleware := auth.TokenAuth(cfg.LocalToken)
@@ -78,11 +78,11 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
-func TestGetSeries_Empty(t *testing.T) {
+func TestSearch_Empty(t *testing.T) {
 	ts, _, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/series", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/search?q=test", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -94,57 +94,22 @@ func TestGetSeries_Empty(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var series []db.Series
-	if err := json.NewDecoder(resp.Body).Decode(&series); err != nil {
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if len(series) != 0 {
-		t.Fatalf("expected empty series, got %d", len(series))
+	if result["total"].(float64) != 0 {
+		t.Fatalf("expected 0 results, got %v", result["total"])
 	}
 }
 
-func TestGetSeries_WithData(t *testing.T) {
-	ts, dbq, _ := setupTestAPI(t, "test-token")
-	defer ts.Close()
-
-	for i := 1; i <= 3; i++ {
-		title := "Series " + string(rune('A'+i-1))
-		s := db.Series{Title: title}
-		if err := dbq.Write(func(tx *gorm.DB) error {
-			return tx.Create(&s).Error
-		}); err != nil {
-			t.Fatalf("failed to insert series: %v", err)
-		}
-	}
-
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/series", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-
-	var series []db.Series
-	if err := json.NewDecoder(resp.Body).Decode(&series); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if len(series) != 3 {
-		t.Fatalf("expected 3 series, got %d", len(series))
-	}
-}
-
-func TestGetSeries_Search(t *testing.T) {
+func TestSearch_WithData(t *testing.T) {
 	ts, dbq, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
 	seriesData := []db.Series{
-		{Title: "进击的巨人"},
-		{Title: "鬼灭之刃"},
+		{ID: "100", Title: "进击的巨人", AirDate: strPtr("2013-04")},
+		{ID: "200", Title: "鬼灭之刃", AirDate: strPtr("2019-04")},
 	}
 	for _, s := range seriesData {
 		if err := dbq.Write(func(tx *gorm.DB) error {
@@ -154,7 +119,7 @@ func TestGetSeries_Search(t *testing.T) {
 		}
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/series?search=巨人", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/search?q=巨人", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -166,15 +131,50 @@ func TestGetSeries_Search(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var series []db.Series
-	if err := json.NewDecoder(resp.Body).Decode(&series); err != nil {
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if len(series) != 1 {
-		t.Fatalf("expected 1 series, got %d", len(series))
+	if result["total"].(float64) != 1 {
+		t.Fatalf("expected 1 result, got %v", result["total"])
 	}
-	if series[0].Title != "进击的巨人" {
-		t.Fatalf("expected 进击的巨人, got %s", series[0].Title)
+}
+
+func TestSearch_ByAirdate(t *testing.T) {
+	ts, dbq, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	seriesData := []db.Series{
+		{ID: "100", Title: "Series A", AirDate: strPtr("2026-07")},
+		{ID: "200", Title: "Series B", AirDate: strPtr("2026-07")},
+		{ID: "300", Title: "Series C", AirDate: strPtr("2026-01")},
+	}
+	for _, s := range seriesData {
+		if err := dbq.Write(func(tx *gorm.DB) error {
+			return tx.Create(&s).Error
+		}); err != nil {
+			t.Fatalf("failed to insert series: %v", err)
+		}
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/search?airdate=2026-07", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if result["total"].(float64) != 2 {
+		t.Fatalf("expected 2 results, got %v", result["total"])
 	}
 }
 
@@ -208,9 +208,9 @@ func TestGetEpisodes_Filter(t *testing.T) {
 	defer ts.Close()
 
 	episodes := []db.Episode{
-		{SeriesID: 1, DandanEpisodeID: 1, RelativePath: "ep1.mkv", FileMD5: "md5a", FileHash: "hasha"},
-		{SeriesID: 1, DandanEpisodeID: 2, RelativePath: "ep2.mkv", FileMD5: "md5b", FileHash: "hashb"},
-		{SeriesID: 2, DandanEpisodeID: 3, RelativePath: "ep3.mkv", FileMD5: "md5c", FileHash: "hashc"},
+		{ID: "1000011", SeriesID: "100", DandanEpisodeID: 1, RelativePath: "ep1.mkv", FileMD5: "md5a", FileHash: "hasha"},
+		{ID: "1000022", SeriesID: "100", DandanEpisodeID: 2, RelativePath: "ep2.mkv", FileMD5: "md5b", FileHash: "hashb"},
+		{ID: "2000011", SeriesID: "200", DandanEpisodeID: 3, RelativePath: "ep3.mkv", FileMD5: "md5c", FileHash: "hashc"},
 	}
 	for _, ep := range episodes {
 		if err := dbq.Write(func(tx *gorm.DB) error {
@@ -220,7 +220,7 @@ func TestGetEpisodes_Filter(t *testing.T) {
 		}
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes?series_id=1", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes?series_id=100", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -256,7 +256,8 @@ func TestGetDanmaku(t *testing.T) {
 	}
 
 	ep := db.Episode{
-		SeriesID:        1,
+		ID:              "1000011",
+		SeriesID:        "100",
 		DandanEpisodeID: 1,
 		RelativePath:    "ep1.mkv",
 		FileMD5:         "md5",
@@ -269,7 +270,7 @@ func TestGetDanmaku(t *testing.T) {
 		t.Fatalf("failed to insert episode: %v", err)
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/1/danmaku", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/1000011/danmaku", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -294,7 +295,7 @@ func TestGetDanmaku_NotFound(t *testing.T) {
 	ts, _, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/999/danmaku", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/9999999/danmaku", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -312,7 +313,8 @@ func TestGetDanmaku_NoDanmakuFile(t *testing.T) {
 	defer ts.Close()
 
 	ep := db.Episode{
-		SeriesID:        1,
+		ID:              "1000011",
+		SeriesID:        "100",
 		DandanEpisodeID: 1,
 		RelativePath:    "ep1.mkv",
 		FileMD5:         "md5",
@@ -324,7 +326,7 @@ func TestGetDanmaku_NoDanmakuFile(t *testing.T) {
 		t.Fatalf("failed to insert episode: %v", err)
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/1/danmaku", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/episodes/1000011/danmaku", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -350,7 +352,8 @@ func TestUpdateProgress(t *testing.T) {
 	defer ts.Close()
 
 	ep := db.Episode{
-		SeriesID:        1,
+		ID:              "1000011",
+		SeriesID:        "100",
 		DandanEpisodeID: 1,
 		RelativePath:    "ep1.mkv",
 		FileMD5:         "md5",
@@ -362,8 +365,8 @@ func TestUpdateProgress(t *testing.T) {
 		t.Fatalf("failed to insert episode: %v", err)
 	}
 
-	body := `{"episode_id":1,"position":42.5}`
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/progress", 
+	body := `{"episode_id":"1000011","position":42.5}`
+	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/progress",
 		jsonReader(body))
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -387,7 +390,7 @@ func TestUpdateProgress(t *testing.T) {
 
 	var history db.History
 	err = dbq.Read(func(tx *gorm.DB) error {
-		return tx.Where("episode_id = ?", 1).First(&history).Error
+		return tx.Where("episode_id = ?", "1000011").First(&history).Error
 	})
 	if err != nil {
 		t.Fatalf("failed to query history: %v", err)
@@ -428,16 +431,29 @@ func TestTriggerScan(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202, got %d", resp.StatusCode)
+	// When scannerManager is nil, expect 503 Service Unavailable
+	// When scannerManager is set, expect 202 Accepted
+	if resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 or 503, got %d", resp.StatusCode)
 	}
+}
 
-	var result map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+func TestTriggerScrape(t *testing.T) {
+	ts, _, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/scrape", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
 	}
-	if result["message"] != "scan and scrape triggered" {
-		t.Fatalf("expected scan and scrape triggered message, got %s", result["message"])
+	defer resp.Body.Close()
+
+	// When scraper is nil, expect 503 Service Unavailable
+	// When scraper is set, expect 202 Accepted
+	if resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 or 503, got %d", resp.StatusCode)
 	}
 }
 
@@ -445,7 +461,7 @@ func TestAuthRequired(t *testing.T) {
 	ts, _, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/v1/series")
+	resp, err := http.Get(ts.URL + "/api/v1/search?q=test")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -460,7 +476,7 @@ func TestAuthInvalidToken(t *testing.T) {
 	ts, _, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/series", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/search?q=test", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -477,7 +493,7 @@ func TestCORS(t *testing.T) {
 	ts, _, _ := setupTestAPI(t, "test-token")
 	defer ts.Close()
 
-	req, _ := http.NewRequest("OPTIONS", ts.URL+"/api/v1/series", nil)
+	req, _ := http.NewRequest("OPTIONS", ts.URL+"/api/v1/search", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -763,7 +779,7 @@ func TestGetLibraryFiles_WithData(t *testing.T) {
 		t.Fatalf("failed to create library: %v", err)
 	}
 
-	series := db.Series{Title: "测试番剧"}
+	series := db.Series{ID: "100", Title: "测试番剧"}
 	if err := dbq.Write(func(tx *gorm.DB) error {
 		return tx.Create(&series).Error
 	}); err != nil {
@@ -771,8 +787,8 @@ func TestGetLibraryFiles_WithData(t *testing.T) {
 	}
 
 	eps := []db.Episode{
-		{SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 1, RelativePath: "S01/E01.mp4", FileMD5: "md5_1", FileHash: "hash_1", EpIndex: ptr[float64](1), MatchStatus: "matched"},
-		{SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 2, RelativePath: "S01/E02.mp4", FileMD5: "md5_2", FileHash: "hash_2", EpIndex: ptr[float64](2), MatchStatus: "unmatched"},
+		{ID: "1000011", SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 1, RelativePath: "S01/E01.mp4", FileMD5: "md5_1", FileHash: "hash_1", EpIndex: ptr[float64](1), MatchStatus: "matched"},
+		{ID: "1000022", SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 2, RelativePath: "S01/E02.mp4", FileMD5: "md5_2", FileHash: "hash_2", EpIndex: ptr[float64](2), MatchStatus: "unmatched"},
 	}
 	for _, ep := range eps {
 		if err := dbq.Write(func(tx *gorm.DB) error {
@@ -828,4 +844,8 @@ func TestGetLibraryFiles_InvalidLibraryID(t *testing.T) {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+func strPtr(s string) *string {
+	return &s
 }

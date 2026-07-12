@@ -16,15 +16,16 @@ import (
 	"time"
 
 	"github.com/l31155/danmaku-overlay/internal/db"
+	"github.com/l31155/danmaku-overlay/internal/utils"
 	"gorm.io/gorm"
 )
 
 var (
-	dandanCommentURL      = "https://api.dandanplay.net/api/v2/comment/%d"
-	dandanMatchURL        = "https://api.dandanplay.net/api/v2/match"
-	dandanSearchURL       = "https://api.dandanplay.net/api/v2/search/episodes"
-	bangumiSearchURL      = "https://api.bgm.tv/v0/search/subjects"
-	bangumiSubjectURL     = "https://api.bgm.tv/v0/subjects/%d"
+	dandanCommentURL       = "https://api.dandanplay.net/api/v2/comment/%d"
+	dandanMatchURL         = "https://api.dandanplay.net/api/v2/match"
+	dandanSearchURL        = "https://api.dandanplay.net/api/v2/search/episodes"
+	bangumiSearchURL       = "https://api.bgm.tv/v0/search/subjects"
+	bangumiSubjectURL      = "https://api.bgm.tv/v0/subjects/%d"
 	bangumiSubjectImageURL = "https://api.bgm.tv/v0/subjects/%d/image?type=large"
 
 	danmakuCacheExpiration = 24 * time.Hour
@@ -37,6 +38,7 @@ type Scraper struct {
 	bangumiLim *TokenBucket
 	client     *http.Client
 	clientDo   func(*http.Request) (*http.Response, error)
+	Progress   *Progress
 }
 
 type bangumiSearchRequest struct {
@@ -68,7 +70,7 @@ type bangumiSearchResponse struct {
 	} `json:"data"`
 }
 
-func NewScraper(dbq *db.DBQueue, dataDir string) *Scraper {
+func NewScraper(dbq *db.DBQueue, dataDir string, progress *Progress) *Scraper {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
@@ -80,17 +82,19 @@ func NewScraper(dbq *db.DBQueue, dataDir string) *Scraper {
 		bangumiLim: NewTokenBucket(2*time.Second, 1),
 		client:     client,
 		clientDo:   client.Do,
+		Progress:   progress,
 	}
 }
 
 func (s *Scraper) ScrapeEpisode(ctx context.Context, ep *db.Episode, series *db.Series) error {
-	if ep.MatchStatus != "unmatched" {
+	if ep.ScrapeStatus != "unscraped" {
 		return nil
 	}
 
 	if series.BangumiID == nil && series.Summary == nil {
 		if err := s.scrapeMetadata(ctx, series); err != nil {
 			slog.Warn("metadata scrape failed", "series", series.Title, "error", err)
+			return err
 		}
 	}
 
@@ -174,7 +178,7 @@ func (s *Scraper) DownloadDanmaku(ctx context.Context, ep *db.Episode) error {
 		return fmt.Errorf("marshal danmaku json: %w", err)
 	}
 
-	jsonPath := filepath.Join(danmakuDir, fmt.Sprintf("%d.json", ep.DandanEpisodeID))
+	jsonPath := filepath.Join(danmakuDir, fmt.Sprintf("%s.json", ep.FileHash))
 	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
 		return fmt.Errorf("write json file: %w", err)
 	}
@@ -366,7 +370,6 @@ func extractKeyword(filePath string) string {
 	}
 
 	// Remove common patterns like [1080p], [HEVC], etc.
-	// This is a simple implementation - can be enhanced
 	result := base
 	for _, pattern := range []string{"[", "]", "(", ")"} {
 		for {
@@ -445,90 +448,95 @@ func (s *Scraper) scrapeMetadata(ctx context.Context, series *db.Series) error {
 		resp.Body.Close()
 	}
 
+	if bgmID == 0 {
+		return fmt.Errorf("bangumi search returned no results for: %s", series.Title)
+	}
+
 	// 2. Fetch Bangumi Details
-	if bgmID != 0 {
-		time.Sleep(1 * time.Second) // rate limit
-		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(bangumiSubjectURL, bgmID), nil)
-		req.Header.Set("User-Agent", "DanmakuOverlay/1.0")
-		if bgmToken != "" {
-			req.Header.Set("Authorization", "Bearer "+bgmToken)
-		}
-		if resp, err := s.clientDo(req); err == nil {
-			if resp.StatusCode == 200 {
-				var subject struct {
-					Name          string `json:"name"`
-					NameCN        string `json:"name_cn"`
-					Summary       string `json:"summary"`
-					Date          string `json:"date"`
-					TotalEpisodes int    `json:"total_episodes"`
-					Images        struct {
-						Large string `json:"large"`
-					} `json:"images"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&subject) == nil {
-					totalEps := uint(subject.TotalEpisodes)
-					s.dbQueue.Write(func(tx *gorm.DB) error {
-						updates := map[string]interface{}{
-							"bangumi_id": bgmID,
-							"summary":    subject.Summary,
-							"total_eps":  totalEps,
-							"air_date":   subject.Date,
-							"name_cn":    subject.NameCN,
-						}
-						tx.Model(series).Updates(updates)
-						series.BangumiID = &bgmID
-						series.Summary = &subject.Summary
-						series.TotalEps = &totalEps
-						series.AirDate = &subject.Date
-						series.NameCN = &subject.NameCN
-						return nil
-					})
+	time.Sleep(1 * time.Second) // rate limit
+	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(bangumiSubjectURL, bgmID), nil)
+	req.Header.Set("User-Agent", "DanmakuOverlay/1.0")
+	if bgmToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bgmToken)
+	}
 
-					if subject.Images.Large != "" {
-						s.downloadCover(ctx, series, subject.Images.Large, fmt.Sprintf("bgm_%d.jpg", bgmID))
-					}
-					slog.Info("bangumi metadata scraped successfully", "title", series.Title, "bangumi_id", bgmID)
-					resp.Body.Close()
-					return nil
-				}
-			}
-			resp.Body.Close()
+	resp, err := s.clientDo(req)
+	if err != nil {
+		return fmt.Errorf("fetch bangumi subject: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("bangumi subject API returned status %d", resp.StatusCode)
+	}
+
+	var subject struct {
+		Name          string `json:"name"`
+		NameCN        string `json:"name_cn"`
+		Summary       string `json:"summary"`
+		Date          string `json:"date"`
+		TotalEpisodes int    `json:"total_episodes"`
+		Rating        struct {
+			Score float64 `json:"score"`
+		} `json:"rating"`
+		Tags []struct {
+			Name string `json:"name"`
+		} `json:"tags"`
+		Images struct {
+			Large string `json:"large"`
+		} `json:"images"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&subject); err != nil {
+		return fmt.Errorf("decode bangumi subject: %w", err)
+	}
+
+	totalEps := uint(subject.TotalEpisodes)
+
+	var tagNames []string
+	for _, tag := range subject.Tags {
+		tagNames = append(tagNames, tag.Name)
+	}
+	tagsJSON, _ := json.Marshal(tagNames)
+	tagsStr := string(tagsJSON)
+
+	airDate := subject.Date
+	if len(airDate) >= 7 {
+		airDate = airDate[:7]
+	}
+
+	// Update series with BangumiID as ID
+	bangumiIDStr := fmt.Sprintf("%d", bgmID)
+	oldID := series.ID
+
+	// Delete old temporary record if it exists
+	if strings.HasPrefix(oldID, "temp_") {
+		if err := s.dbQueue.Write(func(tx *gorm.DB) error {
+			return tx.Where("id = ?", oldID).Delete(&db.Series{}).Error
+		}); err != nil {
+			return fmt.Errorf("delete temp series: %w", err)
 		}
 	}
 
-	// 3. TMDB Fallback
-	tmdbKey := apiKeys["tmdb_api_key"]
-	if tmdbKey != "" {
-		slog.Info("bangumi failed or not found, trying tmdb", "title", series.Title)
-		tmdbUrl := fmt.Sprintf("https://api.themoviedb.org/3/search/tv?query=%s&api_key=%s&language=zh-CN", url.QueryEscape(series.Title), tmdbKey)
-		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, tmdbUrl, nil)
-		if resp, err := s.clientDo(req); err == nil {
-			if resp.StatusCode == 200 {
-				var tmdbResp struct {
-					Results []struct {
-						ID         uint   `json:"id"`
-						Overview   string `json:"overview"`
-						PosterPath string `json:"poster_path"`
-					} `json:"results"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&tmdbResp) == nil && len(tmdbResp.Results) > 0 {
-					res := tmdbResp.Results[0]
-					s.dbQueue.Write(func(tx *gorm.DB) error {
-						tx.Model(series).Updates(map[string]interface{}{
-							"summary": res.Overview,
-						})
-						series.Summary = &res.Overview
-						return nil
-					})
-					if res.PosterPath != "" {
-						imgUrl := "https://image.tmdb.org/t/p/w500" + res.PosterPath
-						s.downloadCover(ctx, series, imgUrl, fmt.Sprintf("tmdb_%d.jpg", res.ID))
-					}
-				}
-			}
-			resp.Body.Close()
-		}
+	// Create new series with bangumiID as ID
+	series.ID = bangumiIDStr
+	series.BangumiID = &bgmID
+	series.Summary = &subject.Summary
+	series.TotalEps = &totalEps
+	series.AirDate = &airDate
+	series.NameCN = &subject.NameCN
+	series.Rating = &subject.Rating.Score
+	series.Tags = &tagsStr
+
+	if err := s.dbQueue.Write(func(tx *gorm.DB) error {
+		return tx.Create(series).Error
+	}); err != nil {
+		return fmt.Errorf("save series: %w", err)
 	}
+
+	if subject.Images.Large != "" {
+		s.downloadCover(ctx, series, subject.Images.Large, fmt.Sprintf("bgm_%d.jpg", bgmID))
+	}
+	slog.Info("bangumi metadata scraped successfully", "title", series.Title, "bangumi_id", bgmID)
 
 	return nil
 }
@@ -547,26 +555,52 @@ func (s *Scraper) getAPIKeys() map[string]string {
 func (s *Scraper) downloadCover(ctx context.Context, series *db.Series, imgUrl, filename string) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, imgUrl, nil)
 	resp, err := s.clientDo(req)
-	if err != nil || resp.StatusCode != 200 {
+	if err != nil {
+		slog.Warn("failed to download cover", "url", imgUrl, "error", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	coverDir := filepath.Join(s.dataDir, "covers")
-	os.MkdirAll(coverDir, 0755)
-	
-	coverPath := filepath.Join(coverDir, filename)
-	f, err := os.Create(coverPath)
-	if err == nil {
-		io.Copy(f, resp.Body)
-		f.Close()
-		relPath := "covers/" + filename
-		s.dbQueue.Write(func(tx *gorm.DB) error {
-			tx.Model(series).Update("cover_path", relPath)
-			series.CoverPath = &relPath
-			return nil
-		})
+	if resp.StatusCode != 200 {
+		slog.Warn("cover download failed with status", "url", imgUrl, "status", resp.StatusCode)
+		return
 	}
+
+	coverDir := filepath.Join(s.dataDir, "covers")
+	if err := os.MkdirAll(coverDir, 0755); err != nil {
+		slog.Error("failed to create cover directory", "error", err)
+		return
+	}
+
+	tmpPath := filepath.Join(coverDir, filename+".tmp")
+	finalPath := filepath.Join(coverDir, filename)
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		slog.Error("failed to create cover file", "path", tmpPath, "error", err)
+		return
+	}
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		slog.Error("failed to write cover file", "path", tmpPath, "error", err)
+		return
+	}
+
+	f.Close()
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		slog.Error("failed to rename cover file", "error", err)
+		return
+	}
+
+	relPath := "covers/" + filename
+	s.dbQueue.Write(func(tx *gorm.DB) error {
+		return tx.Model(series).Update("cover_path", relPath).Error
+	})
+	series.CoverPath = &relPath
 }
 
 func getSeriesTitle(relPath string) string {
@@ -587,15 +621,22 @@ func getSeriesTitle(relPath string) string {
 }
 
 func (s *Scraper) ScrapeAllUnmatched(ctx context.Context) error {
+	start := time.Now()
+
 	var episodes []db.Episode
 	if err := s.dbQueue.Read(func(tx *gorm.DB) error {
-		return tx.Where("match_status = ?", "unmatched").Find(&episodes).Error
+		return tx.Where("scrape_status = ?", "unscraped").Find(&episodes).Error
 	}); err != nil {
-		return fmt.Errorf("query unmatched episodes: %w", err)
+		return fmt.Errorf("query unscraped episodes: %w", err)
 	}
 
-	slog.Info("scraping unmatched episodes", "count", len(episodes))
+	slog.Info("scraping unscraped episodes", "count", len(episodes))
 
+	if s.Progress != nil {
+		s.Progress.SetScrapeRunning(len(episodes))
+	}
+
+	var scraped, failed int
 	for i, ep := range episodes {
 		select {
 		case <-ctx.Done():
@@ -603,44 +644,134 @@ func (s *Scraper) ScrapeAllUnmatched(ctx context.Context) error {
 		default:
 		}
 
+		if s.Progress != nil {
+			s.Progress.UpdateScrapeProgress(i+1, len(episodes))
+		}
+
 		slog.Info("scraping episode", "progress", fmt.Sprintf("%d/%d", i+1, len(episodes)), "file", ep.RelativePath)
 
+		// 1. Get series title from directory
+		dirName := getSeriesTitle(ep.RelativePath)
+
+		// 2. Find or create series
 		var series db.Series
-		if ep.SeriesID == 0 {
-			dirName := getSeriesTitle(ep.RelativePath)
-			if err := s.dbQueue.Write(func(tx *gorm.DB) error {
-				if err := tx.Where(db.Series{Title: dirName}).FirstOrCreate(&series).Error; err != nil {
-					return err
-				}
-				ep.SeriesID = series.ID
-				return tx.Model(&ep).Update("series_id", series.ID).Error
-			}); err != nil {
-				slog.Warn("failed to create/load series from path", "error", err)
-				continue
+		if err := s.dbQueue.Read(func(tx *gorm.DB) error {
+			return tx.Where("title = ?", dirName).First(&series).Error
+		}); err != nil {
+			// Series not found, create temporary series with temp ID
+			tempID := fmt.Sprintf("temp_%d", time.Now().UnixNano())
+			series = db.Series{
+				ID:    tempID,
+				Title: dirName,
 			}
-		} else {
 			if err := s.dbQueue.Write(func(tx *gorm.DB) error {
-				return tx.First(&series, ep.SeriesID).Error
+				return tx.Create(&series).Error
 			}); err != nil {
-				slog.Warn("failed to load series", "series_id", ep.SeriesID, "error", err)
+				slog.Warn("failed to create series", "error", err)
+				s.updateEpisodeStatus(&ep, "no_match")
+				failed++
 				continue
 			}
 		}
 
-		if err := s.ScrapeEpisode(ctx, &ep, &series); err != nil {
-			slog.Warn("failed to scrape episode", "file", ep.RelativePath, "error", err)
+		// 3. Scrape metadata if needed
+		if series.BangumiID == nil {
+			if err := s.scrapeMetadata(ctx, &series); err != nil {
+				slog.Warn("metadata scrape failed", "series", series.Title, "error", err)
+				s.updateEpisodeStatus(&ep, "no_match")
+				failed++
+				continue
+			}
+		}
+
+		// 4. Generate Episode ID
+		if series.BangumiID == nil {
+			slog.Warn("series has no bangumi_id", "series", series.Title)
+			s.updateEpisodeStatus(&ep, "no_match")
+			failed++
 			continue
 		}
 
-		// 刮削成功或失败，都将其状态更新为 matched，避免下次继续扫描
-		if err := s.dbQueue.Write(func(tx *gorm.DB) error {
-			return tx.Model(&ep).Update("match_status", "matched").Error
-		}); err != nil {
-			slog.Warn("failed to update match status to matched", "error", err)
+		// Extract epIndex from filename
+		filename := filepath.Base(ep.RelativePath)
+		epIndex := utils.ExtractEpIndexFromFilename(filename)
+
+		// Generate episode ID
+		episodeID := utils.GenerateEpisodeID(*series.BangumiID, epIndex)
+
+		// 5. Update episode with IDs
+		// First check if episode already exists by relative_path
+		var existingEp db.Episode
+		if err := s.dbQueue.Read(func(tx *gorm.DB) error {
+			return tx.Where("relative_path = ?", ep.RelativePath).First(&existingEp).Error
+		}); err == nil {
+			// Episode exists, update it in place using WHERE relative_path
+			if err := s.dbQueue.Write(func(tx *gorm.DB) error {
+				return tx.Model(&db.Episode{}).Where("relative_path = ?", ep.RelativePath).Updates(map[string]interface{}{
+					"id":           episodeID,
+					"series_id":    series.ID,
+					"ep_index":     float64Ptr(float64(epIndex)),
+				}).Error
+			}); err != nil {
+				slog.Warn("failed to update episode", "error", err)
+				failed++
+				continue
+			}
+		} else {
+			// Episode not found, create new one
+			ep.ID = episodeID
+			ep.SeriesID = series.ID
+			ep.EpIndex = float64Ptr(float64(epIndex))
+			if err := s.dbQueue.Write(func(tx *gorm.DB) error {
+				return tx.Create(&ep).Error
+			}); err != nil {
+				slog.Warn("failed to create episode", "error", err)
+				failed++
+				continue
+			}
 		}
+
+		// 6. Update series current_ep
+		s.updateSeriesCurrentEp(series.ID)
+
+		// 7. Update scrape status
+		s.updateEpisodeStatus(&ep, "completed")
+		scraped++
+	}
+
+	elapsed := time.Since(start)
+	if s.Progress != nil {
+		s.Progress.SetScrapeCompleted(fmt.Sprintf("%d/%d scraped, %d failed, %s", scraped, len(episodes), failed, elapsed.Round(time.Millisecond).String()))
 	}
 
 	return nil
+}
+
+func (s *Scraper) updateEpisodeStatus(ep *db.Episode, status string) {
+	s.dbQueue.Write(func(tx *gorm.DB) error {
+		return tx.Model(&db.Episode{}).Where("relative_path = ?", ep.RelativePath).Updates(map[string]interface{}{
+			"scrape_status": status,
+			"match_status":  status,
+		}).Error
+	})
+}
+
+func (s *Scraper) updateSeriesCurrentEp(seriesID string) {
+	var count int64
+	s.dbQueue.Read(func(tx *gorm.DB) error {
+		return tx.Model(&db.Episode{}).
+			Where("series_id = ? AND scrape_status = ?", seriesID, "completed").
+			Count(&count).Error
+	})
+
+	currentEp := uint(count)
+	s.dbQueue.Write(func(tx *gorm.DB) error {
+		return tx.Model(&db.Series{}).Where("id = ?", seriesID).Update("current_ep", currentEp).Error
+	})
+}
+
+func float64Ptr(f float64) *float64 {
+	return &f
 }
 
 type HTTPError struct {

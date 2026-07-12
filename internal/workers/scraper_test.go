@@ -3,6 +3,7 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,7 +16,7 @@ func TestNewScraper(t *testing.T) {
 	_, dbq, dir := setupTestDB(t)
 	defer dbq.Close()
 
-	s := NewScraper(dbq, dir)
+	s := NewScraper(dbq, dir, nil)
 	if s == nil {
 		t.Fatal("NewScraper returned nil")
 	}
@@ -85,7 +86,7 @@ func TestScrapeEpisode_Unmatched(t *testing.T) {
 		t.Fatalf("failed to create episode: %v", err)
 	}
 
-	s := NewScraper(dbq, dir)
+	s := NewScraper(dbq, dir, nil)
 	s.clientDo = ts.Client().Do
 
 	err := s.ScrapeEpisode(context.Background(), ep, series)
@@ -115,9 +116,9 @@ func TestScrapeEpisode_Unmatched(t *testing.T) {
 	}
 
 	if updatedSeries.AirDate == nil {
-		t.Error("AirDate is nil, want '2024-01-01'")
-	} else if *updatedSeries.AirDate != "2024-01-01" {
-		t.Errorf("AirDate = %q, want '2024-01-01'", *updatedSeries.AirDate)
+		t.Error("AirDate is nil, want '2024-01'")
+	} else if *updatedSeries.AirDate != "2024-01" {
+		t.Errorf("AirDate = %q, want '2024-01'", *updatedSeries.AirDate)
 	}
 }
 
@@ -142,7 +143,7 @@ func TestScrapeEpisode_AlreadyMatched(t *testing.T) {
 		t.Fatalf("failed to create episode: %v", err)
 	}
 
-	s := NewScraper(dbq, dir)
+	s := NewScraper(dbq, dir, nil)
 	err := s.ScrapeEpisode(context.Background(), ep, series)
 	if err != nil {
 		t.Fatalf("ScrapeEpisode() error: %v", err)
@@ -194,21 +195,12 @@ func TestScrapeEpisode_BangumiNotFound(t *testing.T) {
 		t.Fatalf("failed to create episode: %v", err)
 	}
 
-	s := NewScraper(dbq, dir)
+	s := NewScraper(dbq, dir, nil)
 	s.clientDo = ts.Client().Do
 
 	err := s.ScrapeEpisode(context.Background(), ep, series)
-	if err != nil {
-		t.Fatalf("ScrapeEpisode() error: %v", err)
-	}
-
-	var updatedSeries db.Series
-	if err := gdb.First(&updatedSeries, series.ID).Error; err != nil {
-		t.Fatalf("failed to fetch updated series: %v", err)
-	}
-
-	if updatedSeries.BangumiID != nil {
-		t.Errorf("BangumiID = %v, want nil", updatedSeries.BangumiID)
+	if err == nil {
+		t.Fatal("ScrapeEpisode() expected error for no bangumi results, got nil")
 	}
 }
 
@@ -261,18 +253,20 @@ func TestScrapeAllUnmatched(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		ep := &db.Episode{
+			ID:           fmt.Sprintf("test_%d", i),
 			SeriesID:     series.ID,
-			RelativePath: filepath.Join("test", "video"+string(rune('A'+i))+".mkv"),
+			RelativePath: filepath.Join("test", "[Sub] Video "+string(rune('A'+i))+" - 0"+string(rune('1'+i))+".mkv"),
 			FileMD5:      "hash" + string(rune('a'+i)),
 			FileHash:     "fhash" + string(rune('a'+i)),
 			MatchStatus:  "unmatched",
+			ScrapeStatus: "unscraped",
 		}
 		if err := gdb.Create(ep).Error; err != nil {
 			t.Fatalf("failed to create episode %d: %v", i, err)
 		}
 	}
 
-	s := NewScraper(dbq, dir)
+	s := NewScraper(dbq, dir, nil)
 	s.clientDo = ts.Client().Do
 
 	err := s.ScrapeAllUnmatched(context.Background())

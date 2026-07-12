@@ -43,9 +43,10 @@ type Scanner struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	OnNewEpisode func(ep *db.Episode)
+	progress     *Progress
 }
 
-func NewScanner(dbq *db.DBQueue, libID uint, rootPath, dataDir string) *Scanner {
+func NewScanner(dbq *db.DBQueue, libID uint, rootPath, dataDir string, progress *Progress) *Scanner {
 	return &Scanner{
 		db:        dbq,
 		libraryID: libID,
@@ -53,6 +54,7 @@ func NewScanner(dbq *db.DBQueue, libID uint, rootPath, dataDir string) *Scanner 
 		dataDir:   dataDir,
 		hashCache: newLRUCache(1000),
 		scanCh:    make(chan struct{}, 1),
+		progress:  progress,
 	}
 }
 
@@ -92,6 +94,61 @@ func (s *Scanner) TriggerScan() {
 	select {
 	case s.scanCh <- struct{}{}:
 	default:
+	}
+}
+
+// ScannerManager manages Scanner instances for multiple Libraries
+type ScannerManager struct {
+	scanners     []*Scanner
+	db           *db.DBQueue
+	dataDir      string
+	ctx          context.Context
+	cancel       context.CancelFunc
+	OnNewEpisode func(ep *db.Episode)
+	Progress     *Progress
+}
+
+// NewScannerManager creates a ScannerManager
+func NewScannerManager(dbq *db.DBQueue, libraries []db.Library, dataDir string, progress *Progress) *ScannerManager {
+	sm := &ScannerManager{
+		db:       dbq,
+		dataDir:  dataDir,
+		Progress: progress,
+	}
+	for _, lib := range libraries {
+		scanner := NewScanner(dbq, lib.ID, lib.RootPath, dataDir, progress)
+		sm.scanners = append(sm.scanners, scanner)
+	}
+	return sm
+}
+
+// Start starts all Scanners
+func (sm *ScannerManager) Start(ctx context.Context) error {
+	sm.ctx, sm.cancel = context.WithCancel(ctx)
+	for _, scanner := range sm.scanners {
+		scanner.OnNewEpisode = sm.OnNewEpisode
+		if err := scanner.Start(sm.ctx); err != nil {
+			slog.Error("failed to start scanner", "library_id", scanner.libraryID, "error", err)
+		}
+	}
+	return nil
+}
+
+// Stop stops all Scanners
+func (sm *ScannerManager) Stop() error {
+	if sm.cancel != nil {
+		sm.cancel()
+	}
+	for _, scanner := range sm.scanners {
+		scanner.Stop()
+	}
+	return nil
+}
+
+// TriggerScan triggers all Scanners to scan
+func (sm *ScannerManager) TriggerScan() {
+	for _, scanner := range sm.scanners {
+		scanner.TriggerScan()
 	}
 }
 
@@ -186,9 +243,36 @@ func (s *Scanner) handleEvent(ctx context.Context, event fsnotify.Event) {
 
 func (s *Scanner) scanFull(ctx context.Context) error {
 	start := time.Now()
-	var totalFiles, succeeded int
+	var totalFiles, newFiles, updatedFiles, skippedFiles int
 
-	slog.Info("full scan started", "root", s.rootPath)
+	slog.Info("scan started", "root", s.rootPath)
+
+	existingFiles := make(map[string]string) // relativePath -> fileHash
+	s.db.Read(func(tx *gorm.DB) error {
+		var episodes []db.Episode
+		tx.Where("library_id = ?", s.libraryID).Find(&episodes)
+		for _, ep := range episodes {
+			existingFiles[ep.RelativePath] = ep.FileHash
+		}
+		return nil
+	})
+
+	// First pass: count total files
+	var fileCount int
+	filepath.WalkDir(s.rootPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if supportedExts[ext] {
+			fileCount++
+		}
+		return nil
+	})
+
+	if s.progress != nil {
+		s.progress.SetScanRunning(fileCount)
+	}
 
 	err := filepath.WalkDir(s.rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -213,11 +297,22 @@ func (s *Scanner) scanFull(ctx context.Context) error {
 
 		totalFiles++
 
+		if s.progress != nil {
+			s.progress.UpdateScanProgress(totalFiles, fileCount)
+		}
+
+		relPath, _ := filepath.Rel(s.rootPath, path)
+
+		if _, exists := existingFiles[relPath]; exists {
+			skippedFiles++
+			return nil
+		}
+
 		if err := s.processFile(ctx, path); err != nil {
 			slog.Warn("failed to process file", "path", path, "error", err)
 			return nil
 		}
-		succeeded++
+		newFiles++
 
 		return nil
 	})
@@ -227,11 +322,18 @@ func (s *Scanner) scanFull(ctx context.Context) error {
 	}
 
 	elapsed := time.Since(start)
-	slog.Info("full scan completed",
+	slog.Info("scan completed",
 		"total", totalFiles,
-		"succeeded", succeeded,
+		"new", newFiles,
+		"updated", updatedFiles,
+		"skipped", skippedFiles,
 		"elapsed", elapsed.String(),
 	)
+
+	if s.progress != nil {
+		s.progress.SetScanCompleted(fmt.Sprintf("%d files, %d new, %s", totalFiles, newFiles, elapsed.Round(time.Millisecond).String()))
+	}
+
 	return nil
 }
 
@@ -288,12 +390,15 @@ func (s *Scanner) processFile(ctx context.Context, absPath string) error {
 	}
 
 	episode := db.Episode{
+		ID:              fmt.Sprintf("%016x", hash),
 		LibraryID:       s.libraryID,
 		RelativePath:    relPath,
 		FileMD5:         md5Str,
 		FileHash:        fmt.Sprintf("%016x", hash),
 		DandanEpisodeID: 0,
 		MatchStatus:     "unmatched",
+		ScrapeStatus:    "unscraped",
+		WatchProgress:   0,
 	}
 
 	if err := s.db.Write(func(tx *gorm.DB) error {

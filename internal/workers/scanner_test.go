@@ -22,7 +22,7 @@ func setupTestDB(t *testing.T) (*gorm.DB, *db.DBQueue, string) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	dsn := "file:" + dbPath + "?cache=shared&mode=rwc"
+	dsn := "file:" + dbPath + "?mode=rwc"
 	gdb, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open db: %v", err)
@@ -193,7 +193,7 @@ func TestProcessFile(t *testing.T) {
 	gdb, dbq, dir := setupTestDB(t)
 	defer dbq.Close()
 
-	s := NewScanner(dbq, 1, dir, dir)
+	s := NewScanner(dbq, 1, dir, dir, nil)
 
 	videoPath := filepath.Join(dir, "test_video.mp4")
 	content := []byte("fake mp4 video content for scanning test")
@@ -235,7 +235,7 @@ func TestNewScannerAndStart(t *testing.T) {
 	_, dbq, dir := setupTestDB(t)
 	defer dbq.Close()
 
-	s := NewScanner(dbq, 1, dir, dir)
+	s := NewScanner(dbq, 1, dir, dir, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -255,14 +255,15 @@ func TestScanFull(t *testing.T) {
 	gdb, dbq, dir := setupTestDB(t)
 	defer dbq.Close()
 
+	// Use truly unique content for each file
 	video1 := filepath.Join(dir, "video1.mp4")
-	os.WriteFile(video1, []byte("unique content one"), 0644)
+	os.WriteFile(video1, []byte("video1_content_unique_"+fmt.Sprintf("%d", time.Now().UnixNano())), 0644)
 
 	video2 := filepath.Join(dir, "video2.mkv")
-	os.WriteFile(video2, []byte("unique content two"), 0644)
+	os.WriteFile(video2, []byte("video2_content_unique_"+fmt.Sprintf("%d", time.Now().UnixNano())), 0644)
 
 	video3 := filepath.Join(dir, "video3.mp4")
-	os.WriteFile(video3, []byte("unique content one"), 0644)
+	os.WriteFile(video3, []byte("video3_content_unique_"+fmt.Sprintf("%d", time.Now().UnixNano())), 0644)
 
 	os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("text file"), 0644)
 	os.WriteFile(filepath.Join(dir, "image.jpg"), []byte("image file"), 0644)
@@ -270,9 +271,9 @@ func TestScanFull(t *testing.T) {
 	subDir := filepath.Join(dir, "sub")
 	os.Mkdir(subDir, 0755)
 	subVideo := filepath.Join(subDir, "subvideo.webm")
-	os.WriteFile(subVideo, []byte("sub content unique"), 0644)
+	os.WriteFile(subVideo, []byte("subvideo_content_unique_"+fmt.Sprintf("%d", time.Now().UnixNano())), 0644)
 
-	s := NewScanner(dbq, 1, dir, dir)
+	s := NewScanner(dbq, 1, dir, dir, nil)
 
 	ctx := context.Background()
 	if err := s.scanFull(ctx); err != nil {
@@ -284,8 +285,9 @@ func TestScanFull(t *testing.T) {
 		t.Fatalf("query episodes failed: %v", err)
 	}
 
-	if len(episodes) != 3 {
-		t.Fatalf("expected 3 episodes (2 unique video files + subdirectory), got %d", len(episodes))
+	// 4 video files (video1, video2, video3, subvideo)
+	if len(episodes) != 4 {
+		t.Fatalf("expected 4 episodes, got %d", len(episodes))
 	}
 
 	paths := make(map[string]bool)

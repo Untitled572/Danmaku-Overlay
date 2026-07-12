@@ -48,6 +48,10 @@ temp/
 
 # Documentation and prompts
 docs/
+!docs/API.md
 prompt/
 scratch/
 test.html
+test/
+.danmaku-dbpath
+danmaku-test

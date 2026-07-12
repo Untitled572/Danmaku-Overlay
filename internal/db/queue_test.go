@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -53,7 +54,7 @@ func TestWriteCreateRecord(t *testing.T) {
 	defer q.Close()
 
 	err := q.Write(func(tx *gorm.DB) error {
-		return tx.Create(&Series{Title: "Queue Test Series"}).Error
+		return tx.Create(&Series{ID: "100", Title: "Queue Test Series"}).Error
 	})
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
@@ -74,7 +75,7 @@ func TestWriteReturnsError(t *testing.T) {
 	defer q.Close()
 
 	err := q.Write(func(tx *gorm.DB) error {
-		return tx.Create(&Series{Title: "Unique Series"}).Error
+		return tx.Create(&Series{ID: "100", Title: "Unique Series"}).Error
 	})
 	if err != nil {
 		t.Fatalf("first write should succeed: %v", err)
@@ -125,7 +126,7 @@ func TestConcurrentWritesSerialExecution(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			err := q.Write(func(tx *gorm.DB) error {
-				return tx.Create(&Series{Title: "Concurrent Series"}).Error
+				return tx.Create(&Series{ID: fmt.Sprintf("conc_%d", idx), Title: "Concurrent Series"}).Error
 			})
 			if err != nil {
 				errs <- err

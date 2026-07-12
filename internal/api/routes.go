@@ -34,6 +34,12 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/library/migration/status":
 		s.handleGetMigrationStatus(w, r)
 		return
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/status":
+		s.handleGetStatus(w, r)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/logs":
+		s.handleGetLogs(w, r)
+		return
 	}
 
 	if s.dbq.Load() == nil {
@@ -42,8 +48,6 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/series":
-		s.handleGetSeries(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/episodes":
 		s.handleGetEpisodes(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/episodes/") && strings.HasSuffix(r.URL.Path, "/danmaku"):
@@ -56,6 +60,8 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 		s.handleUpdateProgress(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/scan":
 		s.handleTriggerScan(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/scrape":
+		s.handleTriggerScrape(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/settings":
 		s.handleGetSettings(w, r)
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/settings":
@@ -66,6 +72,10 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 		s.handleGetLibraryFiles(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/library":
 		s.handleCreateLibrary(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/search":
+		s.handleSearch(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/play":
+		s.handlePlay(w, r)
 	default:
 		writeError(w, "not found", http.StatusNotFound)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/l31155/danmaku-overlay/internal/api"
 	"github.com/l31155/danmaku-overlay/internal/config"
 	"github.com/l31155/danmaku-overlay/internal/db"
+	dlog "github.com/l31155/danmaku-overlay/internal/log"
 	"github.com/l31155/danmaku-overlay/internal/websocket"
 	"github.com/l31155/danmaku-overlay/internal/workers"
 	"gorm.io/gorm"
@@ -22,13 +23,34 @@ import (
 func main() {
 	cfg := config.Load()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	// Create log collector
+	logDir := filepath.Join(cfg.DataDir, "logs")
+	logCollector, err := dlog.NewCollector(logDir, cfg.LogMaxDays)
+	if err != nil {
+		slog.Error("failed to create log collector", "error", err)
+		os.Exit(1)
+	}
+	defer logCollector.Close()
+
+	// Start log cleanup routine
+	dlog.StartCleanupRoutine(context.Background(), logCollector, 24)
+
+	// Create multi-handler for stderr + file
+	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: cfg.LogLevel,
-	})))
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.String(slog.TimeKey, a.Value.Time().Format("01-02 15:04:05"))
+			}
+			return a
+		},
+	})
+	fileHandler := dlog.NewFileHandler(logCollector, cfg.LogLevel)
+	multiHandler := dlog.NewMultiHandler(stderrHandler, fileHandler)
+
+	slog.SetDefault(slog.New(multiHandler))
 
 	slog.Info("starting Danmaku Media Core")
-
-	os.MkdirAll(cfg.DataDir, 0755)
 
 	// Try to load persisted db_path from .danmaku-dbpath config file
 	if persistedPath, err := db.ReadDBPathConfig(); err == nil && persistedPath != "" {
@@ -45,8 +67,9 @@ func main() {
 
 	// Conditional database initialization
 	var queue *db.DBQueue
-	var scanner *workers.Scanner
+	var scannerManager *workers.ScannerManager
 	var scraper *workers.Scraper
+	progress := workers.NewProgress()
 
 	if _, err := os.Stat(cfg.DBPath); err == nil {
 		queue, err = db.InitDB(cfg)
@@ -129,17 +152,17 @@ func main() {
 		})
 
 		if len(libraries) > 0 {
-			scanner = workers.NewScanner(queue, libraries[0].ID, libraries[0].RootPath, cfg.DataDir)
-			if err := scanner.Start(ctx); err != nil {
-				slog.Error("failed to start scanner", "error", err)
+			scannerManager = workers.NewScannerManager(queue, libraries, cfg.DataDir, progress)
+			if err := scannerManager.Start(ctx); err != nil {
+				slog.Error("failed to start scanner manager", "error", err)
 			}
 		}
 
-		scraper = workers.NewScraper(queue, cfg.DataDir)
+		scraper = workers.NewScraper(queue, cfg.DataDir, progress)
 
-		if scanner != nil {
+		if scannerManager != nil {
 			scrapeTriggerCh := make(chan struct{}, 1)
-			scanner.OnNewEpisode = func(ep *db.Episode) {
+			scannerManager.OnNewEpisode = func(ep *db.Episode) {
 				select {
 				case scrapeTriggerCh <- struct{}{}:
 				default:
@@ -153,33 +176,45 @@ func main() {
 					slog.Error("initial scraping failed", "error", err)
 				}
 
-				ticker := time.NewTicker(24 * time.Hour)
-				defer ticker.Stop()
+			scanIntervalHours := 24
+			queue.Read(func(tx *gorm.DB) error {
+				var setting db.Setting
+				if err := tx.Where("key = ?", "scan_interval_hours").First(&setting).Error; err == nil {
+					json.Unmarshal(setting.Value, &scanIntervalHours)
+				}
+				return nil
+			})
+			if scanIntervalHours <= 0 {
+				scanIntervalHours = 24
+			}
 
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						slog.Info("scheduled 24h background scraping started")
-						if err := scraper.ScrapeAllUnmatched(ctx); err != nil {
-							slog.Error("scheduled scraping failed", "error", err)
-						}
-					case <-scrapeTriggerCh:
-						time.Sleep(2 * time.Second)
-						slog.Info("real-time background scraping started (triggered by file change)")
-						if err := scraper.ScrapeAllUnmatched(ctx); err != nil {
-							slog.Error("real-time scraping failed", "error", err)
-						}
+			ticker := time.NewTicker(time.Duration(scanIntervalHours) * time.Hour)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					slog.Info("scheduled background scraping started", "interval_hours", scanIntervalHours)
+					if err := scraper.ScrapeAllUnmatched(ctx); err != nil {
+						slog.Error("scheduled scraping failed", "error", err)
+					}
+				case <-scrapeTriggerCh:
+					time.Sleep(2 * time.Second)
+					slog.Info("real-time background scraping started (triggered by file change)")
+					if err := scraper.ScrapeAllUnmatched(ctx); err != nil {
+						slog.Error("real-time scraping failed", "error", err)
 					}
 				}
+			}
 			}()
 		}
 	} else {
 		slog.Info("no database found, waiting for POST /api/v1/library/init to create one")
 	}
 
-	apiServer := api.NewServer(queue, hub, cfg, scraper, scanner)
+	apiServer := api.NewServer(queue, hub, cfg, scraper, scannerManager, progress, logCollector, ctx)
 
 	go func() {
 		addr := ":" + cfg.Port
@@ -208,8 +243,8 @@ func main() {
 				slog.Error("HTTP server shutdown error", "error", err)
 			}
 
-			if scanner != nil {
-				scanner.Stop()
+			if scannerManager != nil {
+				scannerManager.Stop()
 			}
 			hub.Stop()
 			if queue != nil {

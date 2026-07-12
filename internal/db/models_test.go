@@ -58,6 +58,7 @@ func TestCreateSeries(t *testing.T) {
 
 	bangumiID := uint(42)
 	series := Series{
+		ID:        "42",
 		BangumiID: &bangumiID,
 		Title:     "Test Anime",
 		CoverPath: strPtr("/covers/test.jpg"),
@@ -68,8 +69,8 @@ func TestCreateSeries(t *testing.T) {
 		t.Fatalf("failed to create series: %v", err)
 	}
 
-	if series.ID == 0 {
-		t.Error("series ID should not be zero after creation")
+	if series.ID == "" {
+		t.Error("series ID should not be empty after creation")
 	}
 }
 
@@ -77,12 +78,12 @@ func TestSeriesBangumiIDUniqueConstraint(t *testing.T) {
 	db := setupMemoryDB(t)
 
 	bangumiID := uint(99)
-	s1 := Series{BangumiID: &bangumiID, Title: "Series A"}
+	s1 := Series{ID: "99", BangumiID: &bangumiID, Title: "Series A"}
 	if err := db.Create(&s1).Error; err != nil {
 		t.Fatalf("failed to create first series: %v", err)
 	}
 
-	s2 := Series{BangumiID: &bangumiID, Title: "Series B"}
+	s2 := Series{ID: "99", BangumiID: &bangumiID, Title: "Series B"}
 	err := db.Create(&s2).Error
 	if err == nil {
 		t.Fatal("expected unique constraint violation for duplicate BangumiID, got nil")
@@ -96,10 +97,11 @@ func TestCreateEpisode(t *testing.T) {
 	db.Create(&lib)
 
 	bangumiID := uint(10)
-	series := Series{BangumiID: &bangumiID, Title: "Series"}
+	series := Series{ID: "10", BangumiID: &bangumiID, Title: "Series"}
 	db.Create(&series)
 
 	ep := Episode{
+		ID:              "100011",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 1,
@@ -112,8 +114,8 @@ func TestCreateEpisode(t *testing.T) {
 		t.Fatalf("failed to create episode: %v", err)
 	}
 
-	if ep.ID == 0 {
-		t.Error("episode ID should not be zero after creation")
+	if ep.ID == "" {
+		t.Error("episode ID should not be empty after creation")
 	}
 }
 
@@ -124,10 +126,11 @@ func TestEpisodeFileHashUniqueConstraint(t *testing.T) {
 	db.Create(&lib)
 
 	bangumiID := uint(20)
-	series := Series{BangumiID: &bangumiID, Title: "Series"}
+	series := Series{ID: "20", BangumiID: &bangumiID, Title: "Series"}
 	db.Create(&series)
 
 	ep1 := Episode{
+		ID:              "200011",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 1,
@@ -140,6 +143,7 @@ func TestEpisodeFileHashUniqueConstraint(t *testing.T) {
 	}
 
 	ep2 := Episode{
+		ID:              "200022",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 2,
@@ -160,10 +164,11 @@ func TestEpisodeRelativePathUniqueConstraint(t *testing.T) {
 	db.Create(&lib)
 
 	bangumiID := uint(30)
-	series := Series{BangumiID: &bangumiID, Title: "Series"}
+	series := Series{ID: "30", BangumiID: &bangumiID, Title: "Series"}
 	db.Create(&series)
 
 	ep1 := Episode{
+		ID:              "300011",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 1,
@@ -176,6 +181,7 @@ func TestEpisodeRelativePathUniqueConstraint(t *testing.T) {
 	}
 
 	ep2 := Episode{
+		ID:              "300022",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 2,
@@ -195,10 +201,11 @@ func TestCreateHistory(t *testing.T) {
 	lib := Library{RootPath: "/media/anime"}
 	db.Create(&lib)
 
-	series := Series{Title: "Anime"}
+	series := Series{ID: "40", Title: "Anime"}
 	db.Create(&series)
 
 	ep := Episode{
+		ID:              "400011",
 		SeriesID:        series.ID,
 		LibraryID:       lib.ID,
 		DandanEpisodeID: 1,
@@ -256,12 +263,12 @@ func TestSettingKeyUniqueConstraint(t *testing.T) {
 func TestSeriesWithNilBangumiID(t *testing.T) {
 	db := setupMemoryDB(t)
 
-	s1 := Series{Title: "No Bangumi ID 1"}
+	s1 := Series{ID: "temp1", Title: "No Bangumi ID 1"}
 	if err := db.Create(&s1).Error; err != nil {
 		t.Fatalf("failed to create series with nil BangumiID: %v", err)
 	}
 
-	s2 := Series{Title: "No Bangumi ID 2"}
+	s2 := Series{ID: "temp2", Title: "No Bangumi ID 2"}
 	if err := db.Create(&s2).Error; err != nil {
 		t.Fatalf("failed to create another series with nil BangumiID: %v", err)
 	}

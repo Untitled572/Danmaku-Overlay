@@ -10,27 +10,38 @@ import (
 	"github.com/l31155/danmaku-overlay/internal/auth"
 	"github.com/l31155/danmaku-overlay/internal/config"
 	"github.com/l31155/danmaku-overlay/internal/db"
+	dlog "github.com/l31155/danmaku-overlay/internal/log"
 	"github.com/l31155/danmaku-overlay/internal/websocket"
 	"github.com/l31155/danmaku-overlay/internal/workers"
 )
 
 type Server struct {
-	server  *http.Server
-	dbq     atomic.Pointer[db.DBQueue]
-	hub     *websocket.Hub
-	cfg     *config.Config
-	scraper *workers.Scraper
-	scanner *workers.Scanner
+	server      *http.Server
+	dbq         atomic.Pointer[db.DBQueue]
+	hub         *websocket.Hub
+	cfg         *config.Config
+	scannerMgr  atomic.Pointer[workers.ScannerManager]
+	scraperPtr  atomic.Pointer[workers.Scraper]
+	progress    *workers.Progress
+	logCollector *dlog.Collector
+	ctx         context.Context
 }
 
-func NewServer(dbq *db.DBQueue, hub *websocket.Hub, cfg *config.Config, scraper *workers.Scraper, scanner *workers.Scanner) *Server {
+func NewServer(dbq *db.DBQueue, hub *websocket.Hub, cfg *config.Config, scraper *workers.Scraper, scannerManager *workers.ScannerManager, progress *workers.Progress, logCollector *dlog.Collector, ctx context.Context) *Server {
 	s := &Server{
-		hub:     hub,
-		cfg:     cfg,
-		scraper: scraper,
-		scanner: scanner,
+		hub:         hub,
+		cfg:         cfg,
+		progress:    progress,
+		logCollector: logCollector,
+		ctx:         ctx,
 	}
 	s.dbq.Store(dbq)
+	if scraper != nil {
+		s.scraperPtr.Store(scraper)
+	}
+	if scannerManager != nil {
+		s.scannerMgr.Store(scannerManager)
+	}
 	return s
 }
 

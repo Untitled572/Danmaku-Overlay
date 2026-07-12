@@ -2,17 +2,18 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/l31155/danmaku-overlay/internal/db"
+	"github.com/l31155/danmaku-overlay/internal/workers"
 )
 
 func writeJSON(w http.ResponseWriter, data any, status int) {
@@ -67,41 +68,14 @@ func (s *Server) handleGetMigrationStatus(w http.ResponseWriter, r *http.Request
 	}, http.StatusOK)
 }
 
-func (s *Server) handleGetSeries(w http.ResponseWriter, r *http.Request) {
-	search := r.URL.Query().Get("search")
-
-	var series []db.Series
-	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
-		q := tx.Model(&db.Series{})
-		if search != "" {
-			q = q.Where("title LIKE ?", "%"+search+"%")
-		}
-		return q.Find(&series).Error
-	})
-	if err != nil {
-		slog.Error("failed to query series", "error", err)
-		writeError(w, "internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	if series == nil {
-		series = []db.Series{}
-	}
-	writeJSON(w, series, http.StatusOK)
-}
-
 func (s *Server) handleGetEpisodes(w http.ResponseWriter, r *http.Request) {
-	seriesIDStr := r.URL.Query().Get("series_id")
+	seriesID := r.URL.Query().Get("series_id")
 
 	var episodes []db.Episode
 	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		q := tx.Model(&db.Episode{})
-		if seriesIDStr != "" {
-			sid, err := strconv.ParseUint(seriesIDStr, 10, 32)
-			if err != nil {
-				return fmt.Errorf("parse series_id: %w", err)
-			}
-			q = q.Where("series_id = ?", sid)
+		if seriesID != "" {
+			q = q.Where("series_id = ?", seriesID)
 		}
 		return q.Find(&episodes).Error
 	})
@@ -120,17 +94,11 @@ func (s *Server) handleGetEpisodes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetDanmaku(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/episodes/")
 	path = strings.TrimSuffix(path, "/danmaku")
-	epIDStr := path
-
-	epID, err := strconv.ParseUint(epIDStr, 10, 32)
-	if err != nil {
-		writeError(w, "invalid episode id", http.StatusBadRequest)
-		return
-	}
+	episodeID := path
 
 	var episode db.Episode
-	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
-		return tx.First(&episode, epID).Error
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("id = ?", episodeID).First(&episode).Error
 	})
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -143,8 +111,8 @@ func (s *Server) handleGetDanmaku(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if episode.DanmakuPath == nil || *episode.DanmakuPath == "" {
-		if s.scraper != nil {
-			if err := s.scraper.DownloadDanmaku(r.Context(), &episode); err != nil {
+		if scraper := s.scraperPtr.Load(); scraper != nil {
+			if err := scraper.DownloadDanmaku(r.Context(), &episode); err != nil {
 				slog.Warn("lazy load danmaku failed", "episode", episode.RelativePath, "error", err)
 			}
 		}
@@ -170,17 +138,11 @@ func (s *Server) handleGetDanmaku(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/episodes/")
 	path = strings.TrimSuffix(path, "/match")
-	epIDStr := path
-
-	epID, err := strconv.ParseUint(epIDStr, 10, 32)
-	if err != nil {
-		writeError(w, "invalid episode id", http.StatusBadRequest)
-		return
-	}
+	episodeID := path
 
 	var episode db.Episode
-	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
-		return tx.First(&episode, epID).Error
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("id = ?", episodeID).First(&episode).Error
 	})
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -192,12 +154,12 @@ func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.scraper == nil {
+	if scraper := s.scraperPtr.Load(); scraper == nil {
 		writeError(w, "scraper not available", http.StatusInternalServerError)
 		return
 	}
 
-	if err := s.scraper.DownloadDanmaku(r.Context(), &episode); err != nil {
+	if err := s.scraperPtr.Load().DownloadDanmaku(r.Context(), &episode); err != nil {
 		slog.Error("match episode failed", "episode", episode.RelativePath, "error", err)
 		writeError(w, "match failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -205,7 +167,7 @@ func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 
 	// Re-fetch episode to get updated fields
 	s.dbq.Load().Read(func(tx *gorm.DB) error {
-		return tx.First(&episode, epID).Error
+		return tx.Where("id = ?", episodeID).First(&episode).Error
 	})
 
 	writeJSON(w, map[string]interface{}{
@@ -216,17 +178,13 @@ func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetProgress(w http.ResponseWriter, r *http.Request) {
-	episodeIDStr := r.URL.Query().Get("episode_id")
+	episodeID := r.URL.Query().Get("episode_id")
 
 	var histories []db.History
 	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		q := tx.Model(&db.History{})
-		if episodeIDStr != "" {
-			eid, err := strconv.ParseUint(episodeIDStr, 10, 32)
-			if err != nil {
-				return fmt.Errorf("parse episode_id: %w", err)
-			}
-			q = q.Where("episode_id = ?", eid)
+		if episodeID != "" {
+			q = q.Where("episode_id = ?", episodeID)
 		}
 		return q.Find(&histories).Error
 	})
@@ -243,8 +201,9 @@ func (s *Server) handleGetProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateProgressRequest struct {
-	EpisodeID uint    `json:"episode_id"`
+	EpisodeID string  `json:"episode_id"`
 	Position  float64 `json:"position"`
+	Duration  float64 `json:"duration"`
 }
 
 func (s *Server) handleUpdateProgress(w http.ResponseWriter, r *http.Request) {
@@ -254,7 +213,7 @@ func (s *Server) handleUpdateProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.EpisodeID == 0 {
+	if req.EpisodeID == "" {
 		writeError(w, "episode_id is required", http.StatusBadRequest)
 		return
 	}
@@ -263,7 +222,20 @@ func (s *Server) handleUpdateProgress(w http.ResponseWriter, r *http.Request) {
 		result := tx.Where(db.History{UserID: 1, EpisodeID: req.EpisodeID}).
 			Assign(db.History{Position: req.Position}).
 			FirstOrCreate(&db.History{})
-		return result.Error
+		if result.Error != nil {
+			return result.Error
+		}
+
+		if req.Duration > 0 {
+			watchProgress := req.Position / req.Duration
+			if watchProgress > 1 {
+				watchProgress = 1
+			}
+			return tx.Model(&db.Episode{}).Where("id = ?", req.EpisodeID).
+				Update("watch_progress", watchProgress).Error
+		}
+
+		return nil
 	})
 	if err != nil {
 		slog.Error("failed to update progress", "error", err)
@@ -274,19 +246,70 @@ func (s *Server) handleUpdateProgress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true}, http.StatusOK)
 }
 
+// handleTriggerScan - 只触发扫描
 func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
 	slog.Info("scan triggered via API")
-	if s.scanner != nil {
-		s.scanner.TriggerScan()
+	sm := s.scannerMgr.Load()
+	if sm == nil {
+		writeError(w, "scanner not initialized, add a library first", http.StatusServiceUnavailable)
+		return
 	}
-	if s.scraper != nil {
-		go func() {
-			if err := s.scraper.ScrapeAllUnmatched(r.Context()); err != nil {
-				slog.Error("manual scrape failed", "error", err)
-			}
-		}()
+	sm.TriggerScan()
+	writeJSON(w, map[string]string{"message": "scan triggered"}, http.StatusAccepted)
+}
+
+// handleTriggerScrape - 只触发刮削
+func (s *Server) handleTriggerScrape(w http.ResponseWriter, r *http.Request) {
+	slog.Info("scrape triggered via API")
+	scraper := s.scraperPtr.Load()
+	if scraper == nil {
+		writeError(w, "scraper not initialized", http.StatusServiceUnavailable)
+		return
 	}
-	writeJSON(w, map[string]string{"message": "scan and scrape triggered"}, http.StatusAccepted)
+	go func() {
+		if err := scraper.ScrapeAllUnmatched(s.ctx); err != nil {
+			slog.Error("scrape failed", "error", err)
+		}
+	}()
+	writeJSON(w, map[string]string{"message": "scrape triggered"}, http.StatusAccepted)
+}
+
+// handleGetStatus - 获取扫描和刮削进度
+func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
+	if s.progress == nil {
+		writeJSON(w, map[string]interface{}{
+			"scan":   map[string]interface{}{"status": "idle"},
+			"scrape": map[string]interface{}{"status": "idle"},
+		}, http.StatusOK)
+		return
+	}
+	writeJSON(w, s.progress.GetStatus(), http.StatusOK)
+}
+
+// handleGetLogs - 获取日志
+func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	if s.logCollector == nil {
+		writeJSON(w, map[string]interface{}{
+			"logs":  []interface{}{},
+			"total": 0,
+		}, http.StatusOK)
+		return
+	}
+
+	level := r.URL.Query().Get("level")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	logs, total := s.logCollector.ReadLogs(level, limit)
+	writeJSON(w, map[string]interface{}{
+		"logs":  logs,
+		"total": total,
+	}, http.StatusOK)
 }
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -331,15 +354,17 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 type LibraryFileResponse struct {
-	ID           uint     `json:"id"`
-	SeriesID     uint     `json:"series_id"`
-	SeriesTitle  string   `json:"series_title"`
-	RelativePath string   `json:"relative_path"`
-	FileMD5      string   `json:"file_md5"`
-	FileHash     string   `json:"file_hash"`
-	EpIndex      *float64 `json:"ep_index"`
-	MatchStatus  string   `json:"match_status"`
-	DanmakuPath  *string  `json:"danmaku_path"`
+	ID            string  `json:"id"`
+	SeriesID      string  `json:"series_id"`
+	SeriesTitle   string  `json:"series_title"`
+	RelativePath  string  `json:"relative_path"`
+	FileMD5       string  `json:"file_md5"`
+	FileHash      string  `json:"file_hash"`
+	EpIndex       *float64 `json:"ep_index"`
+	MatchStatus   string  `json:"match_status"`
+	ScrapeStatus  string  `json:"scrape_status"`
+	WatchProgress float64 `json:"watch_progress"`
+	DanmakuPath   *string `json:"danmaku_path"`
 }
 
 func (s *Server) handleGetLibraryFiles(w http.ResponseWriter, r *http.Request) {
@@ -357,7 +382,10 @@ func (s *Server) handleGetLibraryFiles(w http.ResponseWriter, r *http.Request) {
 	var files []LibraryFileResponse
 	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.Table("episodes").
-			Select("episodes.id, episodes.series_id, COALESCE(series.title, '') as series_title, episodes.relative_path, episodes.file_md5, episodes.file_hash, episodes.ep_index, episodes.match_status, episodes.danmaku_path").
+			Select(`episodes.id, episodes.series_id, COALESCE(series.title, '') as series_title,
+            episodes.relative_path, episodes.file_md5, episodes.file_hash,
+            episodes.ep_index, episodes.match_status, episodes.scrape_status,
+            episodes.watch_progress, episodes.danmaku_path`).
 			Joins("LEFT JOIN series ON series.id = episodes.series_id").
 			Where("episodes.library_id = ?", lid).
 			Order("episodes.series_id, episodes.ep_index").
@@ -416,6 +444,22 @@ func (s *Server) handleInitLibrary(w http.ResponseWriter, r *http.Request) {
 
 	s.dbq.Store(newQueue)
 	slog.Info("database initialized", "path", req.DBPath)
+
+	// Create ScannerManager and Scraper after database initialization
+	var libraries []db.Library
+	newQueue.Read(func(tx *gorm.DB) error {
+		return tx.Find(&libraries).Error
+	})
+
+	if len(libraries) > 0 {
+		sm := workers.NewScannerManager(newQueue, libraries, s.cfg.DataDir, s.progress)
+		sm.Start(s.ctx)
+		s.scannerMgr.Store(sm)
+	}
+
+	scraper := workers.NewScraper(newQueue, s.cfg.DataDir, s.progress)
+	s.scraperPtr.Store(scraper)
+
 	writeJSON(w, map[string]string{"db_path": req.DBPath, "message": "database initialized"}, http.StatusCreated)
 }
 
@@ -459,5 +503,156 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update ScannerManager with new library
+	var libraries []db.Library
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Find(&libraries).Error
+	})
+
+	if len(libraries) > 0 {
+		sm := workers.NewScannerManager(s.dbq.Load(), libraries, s.cfg.DataDir, s.progress)
+		sm.Start(s.ctx)
+		s.scannerMgr.Store(sm)
+	}
+
 	writeJSON(w, library, http.StatusCreated)
+}
+
+// handleSearch - 增强搜索功能
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	airdate := r.URL.Query().Get("airdate")
+	ratingMin := r.URL.Query().Get("rating_min")
+	tags := r.URL.Query().Get("tags")
+
+	var series []db.Series
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		query := tx.Model(&db.Series{})
+
+		if q != "" {
+			query = query.Where("title LIKE ? OR name_cn LIKE ?", "%"+q+"%", "%"+q+"%")
+		}
+		if airdate != "" {
+			query = query.Where("air_date = ?", airdate)
+		}
+		if ratingMin != "" {
+			minRating, err := strconv.ParseFloat(ratingMin, 64)
+			if err == nil {
+				query = query.Where("rating >= ?", minRating)
+			}
+		}
+		if tags != "" {
+			for _, tag := range strings.Split(tags, ",") {
+				tag = strings.TrimSpace(tag)
+				if tag != "" {
+					query = query.Where("tags LIKE ?", "%"+tag+"%")
+				}
+			}
+		}
+
+		return query.Order("air_date DESC, id ASC").Find(&series).Error
+	})
+	if err != nil {
+		slog.Error("failed to search series", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if series == nil {
+		series = []db.Series{}
+	}
+	writeJSON(w, map[string]interface{}{
+		"series": series,
+		"total":  len(series),
+	}, http.StatusOK)
+}
+
+// isDanmakuEnabled 检查弹幕开关是否开启，默认不开启
+func (s *Server) isDanmakuEnabled() bool {
+	if s.dbq.Load() == nil {
+		return false
+	}
+	var setting db.Setting
+	if err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("key = ?", "danmaku_enabled").First(&setting).Error
+	}); err != nil {
+		return false
+	}
+	var enabled bool
+	json.Unmarshal(setting.Value, &enabled)
+	return enabled
+}
+
+// handlePlay - 开始播放
+func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
+	episodeID := r.URL.Query().Get("episode_id")
+	if episodeID == "" {
+		writeError(w, "episode_id is required", http.StatusBadRequest)
+		return
+	}
+
+	var episode db.Episode
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("id = ?", episodeID).First(&episode).Error
+	})
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			writeError(w, "episode not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to query episode", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	var library db.Library
+	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.First(&library, episode.LibraryID).Error
+	})
+	if err != nil {
+		slog.Error("failed to query library", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	var series db.Series
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("id = ?", episode.SeriesID).First(&series).Error
+	})
+
+	now := time.Now()
+	s.dbq.Load().Write(func(tx *gorm.DB) error {
+		return tx.Model(&episode).Update("last_played_at", now).Error
+	})
+	if now.After(series.LastPlayedAt) {
+		s.dbq.Load().Write(func(tx *gorm.DB) error {
+			return tx.Model(&series).Update("last_played_at", now).Error
+		})
+	}
+
+	filePath := filepath.Join(library.RootPath, episode.RelativePath)
+
+	danmakuLoaded := false
+	if s.isDanmakuEnabled() {
+		if episode.DanmakuPath != nil && *episode.DanmakuPath != "" {
+			danmakuLoaded = true
+		} else if scraper := s.scraperPtr.Load(); scraper != nil {
+			if err := scraper.DownloadDanmaku(r.Context(), &episode); err != nil {
+				slog.Warn("load danmaku failed during play", "episode", episode.RelativePath, "error", err)
+			} else {
+				danmakuLoaded = true
+			}
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"episode_id":     episode.ID,
+		"file_path":      filePath,
+		"danmaku_loaded": danmakuLoaded,
+		"danmaku_path":   episode.DanmakuPath,
+		"series_title":   series.Title,
+		"series_name_cn": series.NameCN,
+		"ep_index":       episode.EpIndex,
+		"watch_progress": episode.WatchProgress,
+	}, http.StatusOK)
 }

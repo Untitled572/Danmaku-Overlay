@@ -5,14 +5,20 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	sqlite "github.com/ncruces/go-sqlite3/gormlite"
 	gorm "gorm.io/gorm"
+	glogger "gorm.io/gorm/logger"
 
 	"github.com/l31155/danmaku-overlay/internal/config"
 )
 
 const dbPathConfigFile = ".danmaku-dbpath"
+
+type nopWriter struct{}
+
+func (nopWriter) Printf(string, ...interface{}) {}
 
 func InitDB(cfg *config.Config) (*DBQueue, error) {
 	dsn := "file:" + cfg.DBPath + "?cache=shared&mode=rwc"
@@ -23,6 +29,15 @@ func InitDB(cfg *config.Config) (*DBQueue, error) {
 		SkipDefaultTransaction: true,
 		PrepareStmt:            true,
 		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger: glogger.New(
+			&nopWriter{},
+			glogger.Config{
+				SlowThreshold:             200 * time.Millisecond,
+				LogLevel:                  glogger.Warn,
+				IgnoreRecordNotFoundError: true,
+				Colorful:                  false,
+			},
+		),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -33,8 +48,8 @@ func InitDB(cfg *config.Config) (*DBQueue, error) {
 		return nil, fmt.Errorf("get underlying sql.DB: %w", err)
 	}
 
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetMaxOpenConns(5)
+	sqlDB.SetMaxIdleConns(5)
 	sqlDB.SetConnMaxLifetime(0)
 
 	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL;"); err != nil {
@@ -51,6 +66,10 @@ func InitDB(cfg *config.Config) (*DBQueue, error) {
 
 	if err := db.AutoMigrate(&Library{}, &Series{}, &Episode{}, &History{}, &Setting{}); err != nil {
 		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+
+	if err := MigrateV2(db); err != nil {
+		slog.Warn("v2 migration failed (may already be applied)", "error", err)
 	}
 
 	slog.Info("database migration completed")
