@@ -23,6 +23,24 @@ func (s *Server) registerRoutes(mux *http.ServeMux, authMiddleware func(http.Han
 }
 
 func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
+	// 这些路由不受 db 就绪状态限制
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/library/init":
+		s.handleInitLibrary(w, r)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/library/init/status":
+		s.handleGetInitStatus(w, r)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/library/migration/status":
+		s.handleGetMigrationStatus(w, r)
+		return
+	}
+
+	if s.dbq.Load() == nil {
+		writeError(w, "database not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/series":
 		s.handleGetSeries(w, r)
@@ -44,6 +62,8 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 		s.handleUpdateSettings(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/library":
 		s.handleGetLibraries(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/library/files":
+		s.handleGetLibraryFiles(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/library":
 		s.handleCreateLibrary(w, r)
 	default:

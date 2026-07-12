@@ -45,5 +45,9 @@ func (q *DBQueue) Close() error {
 	close(q.writeCh)
 	q.wg.Wait()
 	close(q.errCh)
-	return nil
+	sqlDB, err := q.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }

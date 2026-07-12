@@ -73,6 +73,9 @@ func TestHealthEndpoint(t *testing.T) {
 	if body["status"] != "ok" {
 		t.Fatalf("expected status ok, got %s", body["status"])
 	}
+	if body["database"] != "ready" {
+		t.Fatalf("expected database ready, got %s", body["database"])
+	}
 }
 
 func TestGetSeries_Empty(t *testing.T) {
@@ -705,4 +708,124 @@ func TestCreateLibrary_InvalidBody(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
+}
+
+func TestGetLibraryFiles_MissingLibraryID(t *testing.T) {
+	ts, _, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/library/files", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetLibraryFiles_Empty(t *testing.T) {
+	ts, _, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/library/files?library_id=999", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var files []LibraryFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected empty files, got %d", len(files))
+	}
+}
+
+func TestGetLibraryFiles_WithData(t *testing.T) {
+	ts, dbq, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	lib := db.Library{RootPath: "/media/anime"}
+	if err := dbq.Write(func(tx *gorm.DB) error {
+		return tx.Create(&lib).Error
+	}); err != nil {
+		t.Fatalf("failed to create library: %v", err)
+	}
+
+	series := db.Series{Title: "测试番剧"}
+	if err := dbq.Write(func(tx *gorm.DB) error {
+		return tx.Create(&series).Error
+	}); err != nil {
+		t.Fatalf("failed to create series: %v", err)
+	}
+
+	eps := []db.Episode{
+		{SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 1, RelativePath: "S01/E01.mp4", FileMD5: "md5_1", FileHash: "hash_1", EpIndex: ptr[float64](1), MatchStatus: "matched"},
+		{SeriesID: series.ID, LibraryID: lib.ID, DandanEpisodeID: 2, RelativePath: "S01/E02.mp4", FileMD5: "md5_2", FileHash: "hash_2", EpIndex: ptr[float64](2), MatchStatus: "unmatched"},
+	}
+	for _, ep := range eps {
+		if err := dbq.Write(func(tx *gorm.DB) error {
+			return tx.Create(&ep).Error
+		}); err != nil {
+			t.Fatalf("failed to create episode: %v", err)
+		}
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/library/files?library_id=1", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var files []LibraryFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(files))
+	}
+	if files[0].SeriesTitle != "测试番剧" {
+		t.Fatalf("expected series_title '测试番剧', got %s", files[0].SeriesTitle)
+	}
+	if files[0].RelativePath != "S01/E01.mp4" {
+		t.Fatalf("expected RelativePath 'S01/E01.mp4', got %s", files[0].RelativePath)
+	}
+}
+
+func TestGetLibraryFiles_InvalidLibraryID(t *testing.T) {
+	ts, _, _ := setupTestAPI(t, "test-token")
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/library/files?library_id=abc", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

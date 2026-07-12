@@ -1,14 +1,18 @@
 package db
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 
 	sqlite "github.com/ncruces/go-sqlite3/gormlite"
 	gorm "gorm.io/gorm"
 
 	"github.com/l31155/danmaku-overlay/internal/config"
 )
+
+const dbPathConfigFile = ".danmaku-dbpath"
 
 func InitDB(cfg *config.Config) (*DBQueue, error) {
 	dsn := "file:" + cfg.DBPath + "?cache=shared&mode=rwc"
@@ -52,4 +56,84 @@ func InitDB(cfg *config.Config) (*DBQueue, error) {
 	slog.Info("database migration completed")
 
 	return NewDBQueue(db), nil
+}
+
+type dbPathConfig struct {
+	DBPath string `json:"db_path"`
+}
+
+func ReadDBPathConfig() (string, error) {
+	data, err := os.ReadFile(dbPathConfigFile)
+	if err != nil {
+		return "", err
+	}
+	var cfg dbPathConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("parse db path config: %w", err)
+	}
+	return cfg.DBPath, nil
+}
+
+func SaveDBPathConfig(path string) error {
+	cfg := dbPathConfig{DBPath: path}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal db path config: %w", err)
+	}
+	if err := os.WriteFile(dbPathConfigFile, data, 0644); err != nil {
+		return fmt.Errorf("write db path config: %w", err)
+	}
+	return nil
+}
+
+const migrationMarkerFile = ".danmaku-migrating"
+
+type MigrationMarker struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+func WriteMigrationMarker(from, to string) error {
+	m := MigrationMarker{From: from, To: to}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal migration marker: %w", err)
+	}
+	if err := os.WriteFile(migrationMarkerFile, data, 0644); err != nil {
+		return fmt.Errorf("write migration marker: %w", err)
+	}
+	return nil
+}
+
+func ReadMigrationMarker() (*MigrationMarker, error) {
+	data, err := os.ReadFile(migrationMarkerFile)
+	if err != nil {
+		return nil, err
+	}
+	var m MigrationMarker
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parse migration marker: %w", err)
+	}
+	return &m, nil
+}
+
+func RemoveMigrationMarker() error {
+	if err := os.Remove(migrationMarkerFile); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func MigrateDBFile(from, to string) error {
+	for _, ext := range []string{"", "-wal", "-shm"} {
+		src := from + ext
+		dst := to + ext
+		if _, err := os.Stat(src); err == nil {
+			if err := os.Rename(src, dst); err != nil {
+				return fmt.Errorf("rename %s -> %s: %w", src, dst, err)
+			}
+			slog.Info("moved database file", "from", src, "to", dst)
+		}
+	}
+	return nil
 }

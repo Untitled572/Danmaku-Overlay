@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/l31155/danmaku-overlay/internal/auth"
@@ -15,7 +16,7 @@ import (
 
 type Server struct {
 	server  *http.Server
-	dbq     *db.DBQueue
+	dbq     atomic.Pointer[db.DBQueue]
 	hub     *websocket.Hub
 	cfg     *config.Config
 	scraper *workers.Scraper
@@ -23,13 +24,14 @@ type Server struct {
 }
 
 func NewServer(dbq *db.DBQueue, hub *websocket.Hub, cfg *config.Config, scraper *workers.Scraper, scanner *workers.Scanner) *Server {
-	return &Server{
-		dbq:     dbq,
+	s := &Server{
 		hub:     hub,
 		cfg:     cfg,
 		scraper: scraper,
 		scanner: scanner,
 	}
+	s.dbq.Store(dbq)
+	return s
 }
 
 func (s *Server) Start(addr string) error {

@@ -12,6 +12,7 @@ type Config struct {
 	LocalToken  string
 	LogLevel    slog.Level
 	LogFilePath string
+	Port        string
 }
 
 func Load() *Config {
@@ -19,6 +20,7 @@ func Load() *Config {
 		DBPath:   getEnv("DB_PATH", "data/danmaku.db"),
 		DataDir:  getEnv("DATA_DIR", "data"),
 		LogLevel: parseLogLevel(getEnv("LOG_LEVEL", "info")),
+		Port:     getEnv("PORT", "8085"),
 	}
 
 	if token := os.Getenv("APP_LOCAL_TOKEN"); token != "" {

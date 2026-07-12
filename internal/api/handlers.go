@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -27,14 +28,50 @@ func writeError(w http.ResponseWriter, msg string, status int) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"status": "ok"}, http.StatusOK)
+	dbStatus := "ready"
+	if s.dbq.Load() == nil {
+		dbStatus = "uninitialized"
+	}
+	writeJSON(w, map[string]string{
+		"status":   "ok",
+		"database": dbStatus,
+	}, http.StatusOK)
+}
+
+func (s *Server) handleGetInitStatus(w http.ResponseWriter, r *http.Request) {
+	dbq := s.dbq.Load()
+	if dbq == nil {
+		writeJSON(w, map[string]interface{}{
+			"initialized": false,
+			"status":      "uninitialized",
+		}, http.StatusOK)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"initialized": true,
+		"db_path":     s.cfg.DBPath,
+		"status":      "ready",
+	}, http.StatusOK)
+}
+
+func (s *Server) handleGetMigrationStatus(w http.ResponseWriter, r *http.Request) {
+	marker, err := db.ReadMigrationMarker()
+	if err != nil {
+		writeJSON(w, map[string]string{"status": "idle"}, http.StatusOK)
+		return
+	}
+	writeJSON(w, map[string]string{
+		"status": "migrating",
+		"from":   marker.From,
+		"to":     marker.To,
+	}, http.StatusOK)
 }
 
 func (s *Server) handleGetSeries(w http.ResponseWriter, r *http.Request) {
 	search := r.URL.Query().Get("search")
 
 	var series []db.Series
-	err := s.dbq.Read(func(tx *gorm.DB) error {
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		q := tx.Model(&db.Series{})
 		if search != "" {
 			q = q.Where("title LIKE ?", "%"+search+"%")
@@ -57,7 +94,7 @@ func (s *Server) handleGetEpisodes(w http.ResponseWriter, r *http.Request) {
 	seriesIDStr := r.URL.Query().Get("series_id")
 
 	var episodes []db.Episode
-	err := s.dbq.Read(func(tx *gorm.DB) error {
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		q := tx.Model(&db.Episode{})
 		if seriesIDStr != "" {
 			sid, err := strconv.ParseUint(seriesIDStr, 10, 32)
@@ -92,7 +129,7 @@ func (s *Server) handleGetDanmaku(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var episode db.Episode
-	err = s.dbq.Read(func(tx *gorm.DB) error {
+	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.First(&episode, epID).Error
 	})
 	if err != nil {
@@ -142,7 +179,7 @@ func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var episode db.Episode
-	err = s.dbq.Read(func(tx *gorm.DB) error {
+	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.First(&episode, epID).Error
 	})
 	if err != nil {
@@ -167,7 +204,7 @@ func (s *Server) handleMatchEpisode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-fetch episode to get updated fields
-	s.dbq.Read(func(tx *gorm.DB) error {
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.First(&episode, epID).Error
 	})
 
@@ -182,7 +219,7 @@ func (s *Server) handleGetProgress(w http.ResponseWriter, r *http.Request) {
 	episodeIDStr := r.URL.Query().Get("episode_id")
 
 	var histories []db.History
-	err := s.dbq.Read(func(tx *gorm.DB) error {
+	err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		q := tx.Model(&db.History{})
 		if episodeIDStr != "" {
 			eid, err := strconv.ParseUint(episodeIDStr, 10, 32)
@@ -222,7 +259,7 @@ func (s *Server) handleUpdateProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.dbq.Write(func(tx *gorm.DB) error {
+	err := s.dbq.Load().Write(func(tx *gorm.DB) error {
 		result := tx.Where(db.History{UserID: 1, EpisodeID: req.EpisodeID}).
 			Assign(db.History{Position: req.Position}).
 			FirstOrCreate(&db.History{})
@@ -254,7 +291,7 @@ func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	var settings []db.Setting
-	if err := s.dbq.Read(func(tx *gorm.DB) error {
+	if err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.Find(&settings).Error
 	}); err != nil {
 		slog.Error("failed to fetch settings", "error", err)
@@ -279,7 +316,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	for key, value := range settingsMap {
 		var setting db.Setting
-		if err := s.dbq.Write(func(tx *gorm.DB) error {
+		if err := s.dbq.Load().Write(func(tx *gorm.DB) error {
 			return tx.Where(db.Setting{Key: key}).
 				Assign(db.Setting{Value: value}).
 				FirstOrCreate(&setting).Error
@@ -293,9 +330,98 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true}, http.StatusOK)
 }
 
+type LibraryFileResponse struct {
+	ID           uint     `json:"id"`
+	SeriesID     uint     `json:"series_id"`
+	SeriesTitle  string   `json:"series_title"`
+	RelativePath string   `json:"relative_path"`
+	FileMD5      string   `json:"file_md5"`
+	FileHash     string   `json:"file_hash"`
+	EpIndex      *float64 `json:"ep_index"`
+	MatchStatus  string   `json:"match_status"`
+	DanmakuPath  *string  `json:"danmaku_path"`
+}
+
+func (s *Server) handleGetLibraryFiles(w http.ResponseWriter, r *http.Request) {
+	libraryIDStr := r.URL.Query().Get("library_id")
+	if libraryIDStr == "" {
+		writeError(w, "library_id is required", http.StatusBadRequest)
+		return
+	}
+	lid, err := strconv.ParseUint(libraryIDStr, 10, 32)
+	if err != nil {
+		writeError(w, "invalid library_id", http.StatusBadRequest)
+		return
+	}
+
+	var files []LibraryFileResponse
+	err = s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Table("episodes").
+			Select("episodes.id, episodes.series_id, COALESCE(series.title, '') as series_title, episodes.relative_path, episodes.file_md5, episodes.file_hash, episodes.ep_index, episodes.match_status, episodes.danmaku_path").
+			Joins("LEFT JOIN series ON series.id = episodes.series_id").
+			Where("episodes.library_id = ?", lid).
+			Order("episodes.series_id, episodes.ep_index").
+			Find(&files).Error
+	})
+	if err != nil {
+		slog.Error("failed to query library files", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if files == nil {
+		files = []LibraryFileResponse{}
+	}
+	writeJSON(w, files, http.StatusOK)
+}
+
+func (s *Server) handleInitLibrary(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DBPath string `json:"db_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.DBPath == "" {
+		writeError(w, "db_path is required", http.StatusBadRequest)
+		return
+	}
+
+	dir := filepath.Dir(req.DBPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		slog.Error("failed to create database directory", "dir", dir, "error", err)
+		writeError(w, "failed to create database directory", http.StatusInternalServerError)
+		return
+	}
+
+	os.MkdirAll(s.cfg.DataDir+"/danmaku", 0755)
+	os.MkdirAll(s.cfg.DataDir+"/covers", 0755)
+
+	s.cfg.DBPath = req.DBPath
+	newQueue, err := db.InitDB(s.cfg)
+	if err != nil {
+		slog.Error("failed to initialize database", "error", err)
+		writeError(w, "failed to initialize database: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := db.SaveDBPathConfig(req.DBPath); err != nil {
+		slog.Error("failed to save db path config", "error", err)
+		writeError(w, "failed to save database path", http.StatusInternalServerError)
+		newQueue.Close()
+		return
+	}
+
+	s.dbq.Store(newQueue)
+	slog.Info("database initialized", "path", req.DBPath)
+	writeJSON(w, map[string]string{"db_path": req.DBPath, "message": "database initialized"}, http.StatusCreated)
+}
+
 func (s *Server) handleGetLibraries(w http.ResponseWriter, r *http.Request) {
 	var libraries []db.Library
-	if err := s.dbq.Read(func(tx *gorm.DB) error {
+	if err := s.dbq.Load().Read(func(tx *gorm.DB) error {
 		return tx.Find(&libraries).Error
 	}); err != nil {
 		slog.Error("failed to fetch libraries", "error", err)
@@ -325,7 +451,7 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	library := db.Library{RootPath: req.RootPath}
-	if err := s.dbq.Write(func(tx *gorm.DB) error {
+	if err := s.dbq.Load().Write(func(tx *gorm.DB) error {
 		return tx.Create(&library).Error
 	}); err != nil {
 		slog.Error("failed to create library", "error", err)
