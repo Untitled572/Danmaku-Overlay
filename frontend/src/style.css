@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-main: #f8fafc;
+    --bg-panel: #ffffff;
+    --accent: #2563eb;
+  }
+  
+  body {
+    background-color: var(--bg-main);
+    color: #1e293b;
+  }
+}

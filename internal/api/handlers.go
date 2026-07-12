@@ -518,6 +518,102 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, library, http.StatusCreated)
 }
 
+func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	if idStr == "" {
+		writeError(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	lid, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		writeError(w, "invalid library id", http.StatusBadRequest)
+		return
+	}
+
+	var library db.Library
+	if err := s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.First(&library, lid).Error
+	}); err != nil {
+		if err == gorm.ErrRecordNotFound {
+			writeError(w, "library not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to query library", "error", err)
+		writeError(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	var episodes []db.Episode
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Where("library_id = ?", lid).Find(&episodes).Error
+	})
+
+	danmakuPaths := make([]string, 0)
+	for _, ep := range episodes {
+		if ep.DanmakuPath != nil && *ep.DanmakuPath != "" {
+			danmakuPaths = append(danmakuPaths, *ep.DanmakuPath)
+		}
+	}
+
+	var orphanSeriesIDs []string
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Raw(`
+			SELECT series_id FROM episodes
+			WHERE series_id IN (SELECT series_id FROM episodes WHERE library_id = ?)
+			GROUP BY series_id
+			HAVING SUM(CASE WHEN library_id != ? THEN 1 ELSE 0 END) = 0
+		`, lid, lid).Scan(&orphanSeriesIDs).Error
+	})
+
+	coverPaths := make([]string, 0)
+	if len(orphanSeriesIDs) > 0 {
+		var orphanSeries []db.Series
+		s.dbq.Load().Read(func(tx *gorm.DB) error {
+			return tx.Where("id IN ?", orphanSeriesIDs).Find(&orphanSeries).Error
+		})
+		for _, ser := range orphanSeries {
+			if ser.CoverPath != nil && *ser.CoverPath != "" {
+				coverPaths = append(coverPaths, *ser.CoverPath)
+			}
+		}
+	}
+
+	s.dbq.Load().Write(func(tx *gorm.DB) error {
+		return tx.Where("library_id = ?", lid).Delete(&db.Episode{}).Error
+	})
+
+	if len(orphanSeriesIDs) > 0 {
+		s.dbq.Load().Write(func(tx *gorm.DB) error {
+			return tx.Where("id IN ?", orphanSeriesIDs).Delete(&db.Series{}).Error
+		})
+	}
+
+	s.dbq.Load().Write(func(tx *gorm.DB) error {
+		return tx.Delete(&db.Library{}, lid).Error
+	})
+
+	for _, p := range danmakuPaths {
+		os.Remove(p)
+	}
+	for _, p := range coverPaths {
+		os.Remove(filepath.Join(s.cfg.DataDir, p))
+	}
+
+	var libraries []db.Library
+	s.dbq.Load().Read(func(tx *gorm.DB) error {
+		return tx.Find(&libraries).Error
+	})
+	if len(libraries) > 0 {
+		sm := workers.NewScannerManager(s.dbq.Load(), libraries, s.cfg.DataDir, s.progress)
+		sm.Start(s.ctx)
+		s.scannerMgr.Store(sm)
+	}
+
+	slog.Info("library deleted", "id", lid, "episodes", len(episodes), "orphan_series", len(orphanSeriesIDs))
+	writeJSON(w, map[string]bool{"ok": true}, http.StatusOK)
+}
+
 // handleSearch - 增强搜索功能
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")

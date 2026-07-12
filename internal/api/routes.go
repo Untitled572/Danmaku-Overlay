@@ -72,6 +72,8 @@ func (s *Server) handleProtected(w http.ResponseWriter, r *http.Request) {
 		s.handleGetLibraryFiles(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/library":
 		s.handleCreateLibrary(w, r)
+	case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/library":
+		s.handleDeleteLibrary(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/search":
 		s.handleSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/play":
