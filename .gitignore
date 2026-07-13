@@ -55,3 +55,7 @@ test.html
 test/
 .danmaku-dbpath
 danmaku-test
+
+# Tauri build artifacts
+frontend/src-tauri/
+output/

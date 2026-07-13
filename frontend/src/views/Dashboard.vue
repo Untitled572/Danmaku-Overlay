@@ -211,7 +211,22 @@ const groupedData = computed(() => {
     if (!groups[key]) groups[key] = []
     groups[key].push(item)
   })
-  const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a))
+  const getSeasonValue = (key: string): number => {
+    if (key === '未知') return 0
+    const match = key.match(/^(\d+)年(冬季|春季|夏季|秋季)$/)
+    if (match) {
+      const year = parseInt(match[1], 10)
+      const season = match[2]
+      let seasonVal = 0
+      if (season === '冬季') seasonVal = 1
+      else if (season === '春季') seasonVal = 2
+      else if (season === '夏季') seasonVal = 3
+      else if (season === '秋季') seasonVal = 4
+      return year * 10 + seasonVal
+    }
+    return 0
+  }
+  const sortedKeys = Object.keys(groups).sort((a, b) => getSeasonValue(b) - getSeasonValue(a))
   return sortedKeys.map(k => {
     const sortedItems = groups[k].sort((a, b) => {
       const numA = parseInt(a.ID, 10)
@@ -432,9 +447,6 @@ const bindToSeries = async (bangumiId: number) => {
             <div class="p-3">
               <div class="flex items-center justify-between gap-1">
                 <h4 class="font-bold text-slate-800 text-sm truncate" :title="item.NameCN || item.Title">{{ item.NameCN || item.Title }}</h4>
-                <span v-if="item.Rating" class="text-xs font-bold text-amber-500 flex items-center gap-0.5 flex-shrink-0">
-                  ★ {{ item.Rating.toFixed(1) }}
-                </span>
               </div>
             </div>
           </div>
@@ -453,9 +465,9 @@ const bindToSeries = async (bangumiId: number) => {
 
           <!-- Left Side -->
           <div class="w-[45%] bg-slate-50 border-r border-slate-200 flex flex-col relative overflow-y-auto custom-scrollbar">
-            <div class="p-8 flex-shrink-0 border-b border-slate-100 bg-white">
+            <div class="p-8 flex-shrink-0 border-b border-slate-100">
               <div class="flex gap-6 mb-6">
-                <div class="w-1/3 rounded-xl overflow-hidden shadow-md flex-shrink-0 relative">
+                <div class="w-1/3 rounded-xl overflow-hidden shadow-md flex-shrink-0 relative self-start">
                   <img :src="coverUrl(selectedSeries)" class="w-full aspect-[3/4] object-cover" />
                 </div>
                 <div class="w-2/3 flex flex-col justify-center">
@@ -465,6 +477,7 @@ const bindToSeries = async (bangumiId: number) => {
                   <div class="flex flex-wrap items-center gap-2 text-xs text-slate-600 mb-3">
                     <span v-if="selectedSeries.TotalEps" class="bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold flex-shrink-0">{{ selectedSeries.TotalEps }} 集</span>
                     <span v-if="selectedSeries.AirDate" class="bg-green-100 text-green-700 px-2 py-1 rounded font-bold flex-shrink-0">{{ selectedSeries.AirDate }}</span>
+                    <span v-if="selectedSeries.Rating" class="bg-amber-100 text-amber-700 px-2 py-1 rounded font-bold flex-shrink-0 flex items-center gap-0.5">★ {{ selectedSeries.Rating.toFixed(1) }}</span>
                     
                     <div :class="showAllTags ? '' : 'max-h-[54px] overflow-hidden'" class="flex flex-wrap gap-2 transition-all duration-300">
                       <span v-for="tag in parsedTags" :key="tag" class="bg-slate-100 text-slate-600 px-2 py-1 rounded font-bold">

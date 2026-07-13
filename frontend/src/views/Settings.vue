@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { MonitorPlay, HardDrive, Save, Type, Check, FolderOpen, Trash2, Database, Key } from 'lucide-vue-next'
+import { MonitorPlay, HardDrive, Save, Type, Check, FolderOpen, Trash2, Database, Key, FileText } from 'lucide-vue-next'
 import { api } from '../services/api'
 import { danmakuApi, type Library } from '../services/danmaku'
 
@@ -8,8 +8,16 @@ const currentTab = ref<'basic' | 'player' | 'api' | 'danmaku'>('basic')
 
 const playerPath = ref('')
 const discordRpc = ref(true)
-const isSaving = ref(false)
-const saveSuccess = ref(false)
+const isSavingDb = ref(false)
+const saveDbSuccess = ref(false)
+const isSavingPlayer = ref(false)
+const savePlayerSuccess = ref(false)
+const savingRpc = ref(false)
+const saveRpcSuccess = ref(false)
+const isSavingApi = ref(false)
+const saveApiSuccess = ref(false)
+const isSavingDanmaku = ref(false)
+const saveDanmakuSuccess = ref(false)
 const healthStatus = ref<'ready' | 'warning' | 'error'>('error')
 
 // DB & Libraries
@@ -133,32 +141,108 @@ const checkHealth = async () => {
   }
 }
 
-const saveSettings = async () => {
-  isSaving.value = true
+const savePlayerConfig = async () => {
+  isSavingPlayer.value = true
   try {
-    const payload = {
-      db_path: JSON.stringify(dbPath.value),
-      playerPath: JSON.stringify(playerPath.value),
-      discordRpc: JSON.stringify(discordRpc.value),
-      danmakuSettings: JSON.stringify(danmakuSettings),
+    await api.put('/settings', {
+      playerPath: JSON.stringify(playerPath.value)
+    })
+    savePlayerSuccess.value = true
+    setTimeout(() => { savePlayerSuccess.value = false }, 2000)
+  } catch (error) {
+    console.error('Failed to save player path:', error)
+    alert('保存播放器路径失败')
+  } finally {
+    isSavingPlayer.value = false
+  }
+}
+
+const saveDiscordRpc = async () => {
+  savingRpc.value = true
+  try {
+    await api.put('/settings', {
+      discordRpc: JSON.stringify(discordRpc.value)
+    })
+    saveRpcSuccess.value = true
+    setTimeout(() => { saveRpcSuccess.value = false }, 2000)
+  } catch (error) {
+    console.error('Failed to save Discord RPC setting:', error)
+    alert('保存 Discord RPC 状态失败')
+  } finally {
+    savingRpc.value = false
+  }
+}
+
+const saveApiKeys = async () => {
+  isSavingApi.value = true
+  try {
+    await api.put('/settings', {
       api_keys: JSON.stringify({
         bangumi_app_id: bangumiAppId.value,
         bangumi_app_secret: bangumiAppSecret.value,
         bangumi_access_token: bangumiAccessToken.value
       })
-    }
-    
-    await api.put('/settings', payload)
-    localStorage.setItem('danmaku_settings', JSON.stringify(danmakuSettings))
-    
-    saveSuccess.value = true
-    setTimeout(() => { saveSuccess.value = false }, 2000)
-    setTimeout(checkHealth, 1000)
+    })
+    saveApiSuccess.value = true
+    setTimeout(() => { saveApiSuccess.value = false }, 2000)
   } catch (error) {
-    console.error('Failed to save settings:', error)
-    alert('保存失败，请检查网络或后端服务')
+    console.error('Failed to save API credentials:', error)
+    alert('保存 API 凭证失败')
   } finally {
-    isSaving.value = false
+    isSavingApi.value = false
+  }
+}
+
+const saveDanmakuSettings = async () => {
+  isSavingDanmaku.value = true
+  try {
+    await api.put('/settings', {
+      danmakuSettings: JSON.stringify(danmakuSettings)
+    })
+    localStorage.setItem('danmaku_settings', JSON.stringify(danmakuSettings))
+    saveDanmakuSuccess.value = true
+    setTimeout(() => { saveDanmakuSuccess.value = false }, 2000)
+  } catch (error) {
+    console.error('Failed to save danmaku settings:', error)
+    alert('保存弹幕设置失败')
+  } finally {
+    isSavingDanmaku.value = false
+  }
+}
+
+const saveDbPath = async () => {
+  let path = dbPath.value.trim()
+  if (!path) {
+    alert('请输入数据库文件路径')
+    return
+  }
+
+  // 如果有必要就自动添加danmaku.db
+  if (!path.toLowerCase().endsWith('.db')) {
+    if (path.endsWith('/') || path.endsWith('\\')) {
+      path += 'danmaku.db'
+    } else {
+      const separator = path.includes('\\') && !path.includes('/') ? '\\' : '/'
+      path += separator + 'danmaku.db'
+    }
+  }
+  dbPath.value = path
+
+  isSavingDb.value = true
+  try {
+    await api.post('/library/init', { db_path: path })
+    await api.put('/settings', { db_path: JSON.stringify(path) })
+    saveDbSuccess.value = true
+    setTimeout(() => { saveDbSuccess.value = false }, 2000)
+    await loadSettings()
+    await loadLibraries()
+    await checkHealth()
+    await fetchStats()
+  } catch (error) {
+    console.error('Failed to save database path:', error)
+    alert('保存数据库位置失败: ' + String(error))
+  } finally {
+    isSavingDb.value = false
   }
 }
 
@@ -173,7 +257,9 @@ const fetchStats = async () => {
   try {
     const episodes = await api.get<any[]>('/episodes')
     totalFiles.value = episodes.length
-    scrapedFiles.value = episodes.filter(ep => ep.DanmakuPath && ep.DanmakuPath !== '').length
+    
+    const status = await danmakuApi.getTaskStatus()
+    scrapedFiles.value = status?.scrape?.current || 0
   } catch (e) {
     console.error('Failed to fetch stats:', e)
   }
@@ -231,6 +317,50 @@ const runScrape = async () => {
   }
 }
 
+const showLogs = ref(false)
+const systemLogs = ref<any[]>([])
+const loadingLogs = ref(false)
+const logFilterLevel = ref('')
+
+const toggleLogs = async () => {
+  showLogs.value = !showLogs.value
+  if (showLogs.value) {
+    await fetchLogs()
+  }
+}
+
+const fetchLogs = async () => {
+  loadingLogs.value = true
+  try {
+    const params: Record<string, string> = { limit: '100' }
+    if (logFilterLevel.value) {
+      params.level = logFilterLevel.value
+    }
+    const res = await api.get<{ logs: any[]; total: number }>('/logs', params)
+    systemLogs.value = res.logs || []
+  } catch (error) {
+    console.error('Failed to fetch logs:', error)
+  } finally {
+    loadingLogs.value = false
+  }
+}
+
+const formatLogTime = (timeStr: string) => {
+  try {
+    const date = new Date(timeStr)
+    return date.toLocaleTimeString()
+  } catch (e) {
+    return timeStr
+  }
+}
+
+const formatLogAttrs = (attrs?: Record<string, string>) => {
+  if (!attrs || Object.keys(attrs).length === 0) return ''
+  return Object.entries(attrs)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(' ')
+}
+
 onMounted(() => {
   loadSettings()
   loadLibraries()
@@ -246,41 +376,8 @@ onMounted(() => {
         <h2 class="text-3xl font-bold text-slate-800">系统设置</h2>
         <p class="text-slate-500 mt-1">配置播放器、目录与刮削偏好</p>
       </div>
-      <button 
-        @click="saveSettings"
-        :disabled="isSaving"
-        class="bg-blue-600 hover:bg-blue-700 disabled:opacity-70 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors shadow-md shadow-blue-500/20">
-        <Check v-if="saveSuccess" :size="18" />
-        <Save v-else :size="18" />
-        {{ saveSuccess ? '已保存' : (isSaving ? '保存中...' : '保存设置') }}
-      </button>
     </header>
 
-    <!-- Health Status Indicator Card -->
-    <div class="mb-6 p-4 rounded-xl border flex items-center justify-between shadow-sm transition-all"
-         :class="{
-           'bg-green-50 border-green-200 text-green-800': healthStatus === 'ready',
-           'bg-yellow-50 border-yellow-200 text-yellow-800': healthStatus === 'warning',
-           'bg-red-50 border-red-200 text-red-800': healthStatus === 'error'
-         }">
-      <div class="flex items-center gap-3">
-        <span class="relative flex h-3 w-3">
-          <span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75"
-                :class="{'bg-green-400': healthStatus === 'ready', 'bg-yellow-400': healthStatus === 'warning', 'bg-red-400': healthStatus === 'error'}"></span>
-          <span class="relative inline-flex rounded-full h-3 w-3"
-                :class="{'bg-green-500': healthStatus === 'ready', 'bg-yellow-500': healthStatus === 'warning', 'bg-red-500': healthStatus === 'error'}"></span>
-        </span>
-        <span class="font-medium text-sm">
-          后端服务状态: 
-          <span v-if="healthStatus === 'ready'" class="font-semibold">正常运行 (Database Ready)</span>
-          <span v-else-if="healthStatus === 'warning'" class="font-semibold">无数据库 (Database Uninitialized)</span>
-          <span v-else class="font-semibold">连接失败 (Connection Error)</span>
-        </span>
-      </div>
-      <button @click="checkHealth" class="text-xs font-semibold underline hover:no-underline opacity-80 hover:opacity-100">
-        手动检测
-      </button>
-    </div>
 
     <!-- Tabs Navigation -->
     <div class="flex border-b border-slate-200 mb-6 bg-slate-100/50 p-1.5 rounded-xl">
@@ -338,6 +435,15 @@ onMounted(() => {
               />
               <button @click="browseDbPath" class="px-3 py-2 bg-white hover:bg-slate-50 text-slate-600 rounded-lg text-sm transition-colors border border-slate-200 shadow-sm" title="浏览文件">
                 <FolderOpen :size="16" />
+              </button>
+              <button 
+                @click="saveDbPath"
+                :disabled="isSavingDb"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-70 text-white rounded-lg text-sm font-medium transition-colors shadow-sm flex items-center gap-1.5"
+              >
+                <Check v-if="saveDbSuccess" :size="16" />
+                <Save v-else :size="16" />
+                {{ saveDbSuccess ? '已保存' : (isSavingDb ? '保存中...' : '保存') }}
               </button>
             </div>
             <p class="text-xs text-slate-500 mt-1.5">修改数据库位置会自动迁移数据到新位置并重启服务。</p>
@@ -434,6 +540,72 @@ onMounted(() => {
               </div>
             </div>
           </div>
+
+          <hr class="border-slate-100" />
+
+          <!-- Logs Viewer -->
+          <div>
+            <h3 class="text-base font-bold text-slate-800 mb-3 flex items-center justify-between">
+              <span class="flex items-center gap-2">
+                <FileText class="text-slate-500" :size="18" />
+                系统运行日志
+              </span>
+              <button 
+                @click="toggleLogs"
+                class="text-xs text-blue-600 hover:underline font-semibold focus:outline-none"
+              >
+                {{ showLogs ? '收起日志' : '展开查看日志' }}
+              </button>
+            </h3>
+            
+            <div v-if="showLogs" class="space-y-3">
+              <div class="flex justify-between items-center gap-2">
+                <div class="flex gap-2">
+                  <select 
+                    v-model="logFilterLevel" 
+                    class="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-700 focus:outline-none shadow-sm"
+                    @change="fetchLogs"
+                  >
+                    <option value="">全部级别</option>
+                    <option value="INFO">INFO</option>
+                    <option value="WARN">WARN</option>
+                    <option value="ERROR">ERROR</option>
+                  </select>
+                  <button 
+                    @click="fetchLogs" 
+                    class="px-2.5 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 rounded-lg text-xs font-medium shadow-sm transition-colors"
+                  >
+                    刷新
+                  </button>
+                </div>
+                <span class="text-[10px] text-slate-400">仅显示最近 100 条日志</span>
+              </div>
+              
+              <div class="bg-slate-900 text-slate-300 font-mono text-xs rounded-xl p-4 overflow-y-auto max-h-[300px] border border-slate-800 shadow-inner custom-scrollbar">
+                <div v-if="loadingLogs" class="text-slate-500 text-center py-4">加载中...</div>
+                <div v-else-if="systemLogs.length === 0" class="text-slate-500 text-center py-4">暂无日志记录</div>
+                <div v-else class="space-y-1.5">
+                  <div v-for="(log, idx) in systemLogs" :key="idx" class="whitespace-pre-wrap break-all border-b border-slate-800/40 pb-1 leading-relaxed">
+                    <span class="text-slate-500">[{{ formatLogTime(log.time) }}]</span>
+                    <span 
+                      class="font-bold px-1 rounded ml-1"
+                      :class="{
+                        'text-green-400 bg-green-950/30': log.level === 'INFO',
+                        'text-yellow-400 bg-yellow-950/30': log.level === 'WARN',
+                        'text-red-400 bg-red-950/30': log.level === 'ERROR'
+                      }"
+                    >
+                      {{ log.level }}
+                    </span>
+                    <span class="text-slate-300 ml-1.5">{{ log.msg }}</span>
+                    <span v-if="log.attrs && Object.keys(log.attrs).length > 0" class="text-slate-400 ml-2 text-[10px] italic">
+                      {{ formatLogAttrs(log.attrs) }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Tab 2: Player Config -->
@@ -449,12 +621,25 @@ onMounted(() => {
               <button @click="browsePlayerPath" class="px-3 py-2 bg-white hover:bg-slate-50 text-slate-600 rounded-lg text-sm transition-colors border border-slate-200 shadow-sm" title="浏览文件">
                 <FolderOpen :size="16" />
               </button>
+              <button 
+                @click="savePlayerConfig"
+                :disabled="isSavingPlayer"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-70 text-white rounded-lg text-sm font-medium transition-colors shadow-sm flex items-center gap-1.5"
+              >
+                <Check v-if="savePlayerSuccess" :size="16" />
+                <Save v-else :size="16" />
+                {{ savePlayerSuccess ? '已保存' : (isSavingPlayer ? '保存中...' : '保存') }}
+              </button>
             </div>
           </div>
           
-          <div class="flex items-center gap-3 bg-slate-50 p-4 rounded-lg border border-slate-200 shadow-sm">
-            <input type="checkbox" id="rpc" v-model="discordRpc" class="w-4 h-4 rounded border-slate-300 text-purple-600 focus:ring-purple-500" />
-            <label for="rpc" class="text-sm text-slate-700 select-none">自动开启 Discord Rich Presence 状态同步</label>
+          <div class="flex items-center justify-between gap-3 bg-slate-50 p-4 rounded-lg border border-slate-200 shadow-sm">
+            <div class="flex items-center gap-3">
+              <input type="checkbox" id="rpc" v-model="discordRpc" @change="saveDiscordRpc" class="w-4 h-4 rounded border-slate-300 text-purple-600 focus:ring-purple-500" />
+              <label for="rpc" class="text-sm text-slate-700 select-none">自动开启 Discord Rich Presence 状态同步</label>
+            </div>
+            <span v-if="savingRpc" class="text-xs text-slate-400 animate-pulse">正在保存...</span>
+            <span v-else-if="saveRpcSuccess" class="text-xs text-green-600 flex items-center gap-1"><Check :size="12" />已保存</span>
           </div>
         </div>
 
@@ -492,6 +677,18 @@ onMounted(() => {
                 class="w-full bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-800 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500 shadow-sm transition-all"
               />
               <p class="text-xs text-slate-400 mt-1">可以直接填入你在 Bangumi 开发者设置中生成的“个人授权口令”。</p>
+            </div>
+
+            <div class="flex justify-end pt-2">
+              <button 
+                @click="saveApiKeys"
+                :disabled="isSavingApi"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-70 text-white rounded-lg text-sm font-medium transition-colors shadow-sm flex items-center gap-1.5"
+              >
+                <Check v-if="saveApiSuccess" :size="16" />
+                <Save v-else :size="16" />
+                {{ saveApiSuccess ? '已保存凭证' : (isSavingApi ? '保存中...' : '保存 API 凭证') }}
+              </button>
             </div>
           </div>
         </div>
@@ -564,6 +761,18 @@ onMounted(() => {
               <input type="checkbox" v-model="danmakuSettings.showBottom" class="w-4 h-4 rounded border-slate-300 text-cyan-600 focus:ring-cyan-500" />
               <span class="text-sm text-slate-700 select-none">底部弹幕</span>
             </label>
+          </div>
+
+          <div class="flex justify-end pt-4 border-t border-slate-100">
+            <button 
+              @click="saveDanmakuSettings"
+              :disabled="isSavingDanmaku"
+              class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-70 text-white rounded-lg text-sm font-medium transition-colors shadow-sm flex items-center gap-1.5"
+            >
+              <Check v-if="saveDanmakuSuccess" :size="16" />
+              <Save v-else :size="16" />
+              {{ saveDanmakuSuccess ? '外观已保存' : (isSavingDanmaku ? '保存中...' : '保存外观设置') }}
+            </button>
           </div>
         </div>
 
